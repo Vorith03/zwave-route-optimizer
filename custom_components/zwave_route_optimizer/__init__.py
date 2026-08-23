@@ -21,6 +21,7 @@ from .const import (
     DEFAULT_MAX_REPEATERS,
     DEFAULT_MIN_IMPROVEMENT,
     DEFAULT_PASSES,
+    DEFAULT_ADAPTIVE_TESTING,
     DEFAULT_ROUNDS,
     DEFAULT_SETTLE_SECONDS,
     DEFAULT_WARMUP,
@@ -36,6 +37,7 @@ ATTR_DEVICE_ID = "device_id"
 ATTR_APPLY = "apply"
 ATTR_ROUNDS = "rounds"
 ATTR_PASSES = "passes"
+ATTR_ADAPTIVE_TESTING = "adaptive_testing"
 ATTR_WARMUP = "warmup"
 ATTR_MAX_REPEATERS = "max_repeaters"
 ATTR_MAX_CANDIDATES = "max_candidates"
@@ -69,6 +71,7 @@ COMMON_SCHEMA = {
         vol.Coerce(float), vol.Range(min=0, max=5)
     ),
     vol.Optional(ATTR_INCLUDE_AUTO, default=True): cv.boolean,
+    vol.Optional(ATTR_ADAPTIVE_TESTING, default=DEFAULT_ADAPTIVE_TESTING): cv.boolean,
     vol.Optional(ATTR_REFRESH_NEIGHBORS, default=False): cv.boolean,
     vol.Optional(ATTR_APPLY_RETURN_ROUTE, default=False): cv.boolean,
     vol.Optional(ATTR_ALLOW_UNVALIDATED_RETURN_ROUTE, default=False): cv.boolean,
@@ -191,6 +194,7 @@ def _options_from_call(call: ServiceCall) -> dict[str, Any]:
         "min_improvement": data[ATTR_MIN_IMPROVEMENT],
         "settle_seconds": data[ATTR_SETTLE_SECONDS],
         "include_auto": data[ATTR_INCLUDE_AUTO],
+        "adaptive_testing": data[ATTR_ADAPTIVE_TESTING],
         "refresh_neighbors": data[ATTR_REFRESH_NEIGHBORS],
         "apply_return_route": data[ATTR_APPLY_RETURN_ROUTE],
         "allow_unvalidated_return_route": data[ATTR_ALLOW_UNVALIDATED_RETURN_ROUTE],

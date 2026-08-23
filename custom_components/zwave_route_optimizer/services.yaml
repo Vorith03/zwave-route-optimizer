@@ -94,6 +94,12 @@ optimize_node:
       default: true
       selector:
         boolean: null
+    adaptive_testing:
+      name: Adaptive candidate testing
+      description: Prioritize generated routes using passive Z-Wave JS RSSI and learned-route statistics. Stop early when a clearly good direct or one-hop route is confirmed. Off benchmarks the full generated candidate set.
+      default: true
+      selector:
+        boolean: null
     refresh_neighbors:
       name: Rediscover repeater neighbors first
       description: Actively rediscover neighbors for always-listening routing nodes
@@ -106,23 +112,23 @@ optimize_network:
   description: Manually benchmark all eligible classic Z-Wave nodes. Sleeping battery
     nodes and Z-Wave Long Range nodes are skipped. All nodes are restored to their
     starting priority-route state while benchmarking. Whole-network writes are
-    intentionally disabled in v0.7.1.
+    intentionally disabled in v0.7.2.
   fields:
     apply:
-      name: Apply best forward routes (disabled in v0.7.1)
-      description: Whole-network writes are intentionally blocked in v0.7.1. Leave this off.
+      name: Apply best forward routes (disabled in v0.7.2)
+      description: Whole-network writes are intentionally blocked in v0.7.2. Leave this off.
       default: false
       selector:
         boolean: null
     apply_return_route:
-      name: Apply suggested return routes (disabled in v0.7.1)
-      description: Whole-network return-route writes are intentionally blocked in v0.7.1. Leave this off; dry runs still analyze and report suggestions.
+      name: Apply suggested return routes (disabled in v0.7.2)
+      description: Whole-network return-route writes are intentionally blocked in v0.7.2. Leave this off; dry runs still analyze and report suggestions.
       default: false
       selector:
         boolean: null
     allow_unvalidated_return_route:
       name: Allow topology-unvalidated return routes
-      description: Reserved for future whole-network return-route writes. Dry-run always reports whether the suggested reverse path is topology-validated. Whole-network writes remain disabled in v0.7.1.
+      description: Reserved for future whole-network return-route writes. Dry-run always reports whether the suggested reverse path is topology-validated. Whole-network writes remain disabled in v0.7.2.
       default: false
       selector:
         boolean: null
@@ -194,6 +200,12 @@ optimize_network:
           mode: box
     include_auto:
       name: Test automatic routing
+      default: true
+      selector:
+        boolean: null
+    adaptive_testing:
+      name: Adaptive candidate testing
+      description: Prioritize generated routes using passive Z-Wave JS RSSI and learned-route statistics. Stop early when a clearly good direct or one-hop route is confirmed. Off benchmarks the full generated candidate set.
       default: true
       selector:
         boolean: null

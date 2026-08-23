@@ -16,6 +16,11 @@ from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
 
 from .const import (
+    ADAPTIVE_DIRECT_MEDIAN_MS,
+    ADAPTIVE_DIRECT_WORST_MS,
+    ADAPTIVE_ONE_HOP_MEDIAN_MS,
+    ADAPTIVE_ONE_HOP_PATHS,
+    ADAPTIVE_ONE_HOP_WORST_MS,
     BPS_TO_ROUTE_SPEED,
     DEFAULT_SAMPLE_INTERVAL,
     ROUTE_SPEED_TO_BPS,
@@ -42,6 +47,8 @@ class Candidate:
     repeaters: tuple[int, ...] | None
     speed: int | None
     label: str
+    rf_score: float = 0.0
+    rf_evidence: tuple[str, ...] = ()
 
     @property
     def is_auto(self) -> bool:
@@ -155,6 +162,8 @@ class BenchResult:
             "route_speed_kbps": RouteOptimizer._route_speed_kbps(
                 self.candidate.speed
             ),
+            "rf_score": round(self.candidate.rf_score, 1),
+            "rf_evidence": list(self.candidate.rf_evidence),
             "warmup_samples_ms": [
                 round(value, 1) for value in self.warmup_samples_ms
             ],
@@ -837,6 +846,114 @@ class RouteOptimizer:
         ]
 
     @staticmethod
+    def _statistics(node: Any) -> dict[str, Any]:
+        """Return serialized Z-Wave JS statistics when available."""
+        data = getattr(node, "data", None)
+        if not isinstance(data, dict):
+            return {}
+        statistics_data = data.get("statistics")
+        return statistics_data if isinstance(statistics_data, dict) else {}
+
+    @staticmethod
+    def _valid_rssi(value: Any) -> float | None:
+        """Normalize a real RSSI value, excluding Z-Wave sentinel/error values."""
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            return None
+        if -130.0 <= numeric <= -20.0:
+            return numeric
+        return None
+
+    @classmethod
+    def _controller_noise_floor(cls, nodes: dict[int, Any], controller_id: int) -> float | None:
+        """Return a conservative controller-local background RSSI hint."""
+        controller = nodes.get(controller_id)
+        if controller is None:
+            return None
+        background = cls._statistics(controller).get("backgroundRSSI")
+        if not isinstance(background, dict):
+            return None
+        values: list[float] = []
+        for channel in background.values():
+            if not isinstance(channel, dict):
+                continue
+            value = cls._valid_rssi(channel.get("average"))
+            if value is None:
+                value = cls._valid_rssi(channel.get("current"))
+            if value is not None:
+                values.append(value)
+        return max(values) if values else None
+
+    @classmethod
+    def _rf_path_hint(cls, repeaters: tuple[int, ...], target_id: int, nodes: dict[int, Any], controller_id: int) -> tuple[float, tuple[str, ...]]:
+        """Rank a path using passive RF/history hints without hard-filtering it."""
+        score = 0.0
+        evidence: list[str] = []
+        target = nodes.get(target_id)
+        if target is None:
+            return score, ()
+        target_stats = cls._statistics(target)
+        noise_floor = cls._controller_noise_floor(nodes, controller_id)
+        first_hop_id = repeaters[0] if repeaters else target_id
+        first_hop = nodes.get(first_hop_id)
+        if first_hop is not None:
+            first_rssi = cls._valid_rssi(cls._statistics(first_hop).get("rssi"))
+            if first_rssi is not None:
+                score += max(0.0, min(45.0, first_rssi + 110.0))
+                evidence.append(f"controller_link_rssi={first_rssi:g}dBm")
+                if noise_floor is not None:
+                    snr = first_rssi - noise_floor
+                    score += max(0.0, min(20.0, snr)) * 0.5
+                    evidence.append(f"controller_snr_hint={snr:g}dB")
+        for route_name, exact_bonus in (("lwr", 90.0), ("nlwr", 70.0)):
+            route = target_stats.get(route_name)
+            if not isinstance(route, dict):
+                continue
+            raw_repeaters = route.get("repeaters")
+            if not isinstance(raw_repeaters, list):
+                continue
+            try:
+                learned = tuple(int(value) for value in raw_repeaters)
+            except (TypeError, ValueError):
+                continue
+            if learned == repeaters:
+                score += exact_bonus
+                evidence.append(f"matches_{route_name}")
+            elif repeaters and any(value in learned for value in repeaters):
+                overlap = len(set(repeaters) & set(learned))
+                score += 12.0 * overlap
+                evidence.append(f"overlaps_{route_name}={overlap}")
+            if learned == repeaters:
+                link_rssi: list[float] = []
+                route_rssi = cls._valid_rssi(route.get("rssi"))
+                if route_rssi is not None:
+                    link_rssi.append(route_rssi)
+                raw_repeater_rssi = route.get("repeaterRSSI")
+                if isinstance(raw_repeater_rssi, list):
+                    for value in raw_repeater_rssi:
+                        normalized = cls._valid_rssi(value)
+                        if normalized is not None:
+                            link_rssi.append(normalized)
+                if link_rssi:
+                    weakest = min(link_rssi)
+                    score += max(0.0, min(35.0, weakest + 110.0))
+                    evidence.append(f"{route_name}_weakest_rssi={weakest:g}dBm")
+        return score, tuple(evidence)
+
+    @staticmethod
+    def _benchmark_is_clean(result: BenchResult) -> bool:
+        return result.failures == 0 and result.wake_failures == 0 and result.slow_samples == 0 and math.isfinite(result.median_ms) and math.isfinite(result.worst_ms)
+
+    @classmethod
+    def _excellent_direct(cls, result: BenchResult) -> bool:
+        return result.candidate.repeaters == () and cls._benchmark_is_clean(result) and result.median_ms <= ADAPTIVE_DIRECT_MEDIAN_MS and result.worst_ms <= ADAPTIVE_DIRECT_WORST_MS
+
+    @classmethod
+    def _excellent_one_hop(cls, result: BenchResult) -> bool:
+        return result.candidate.repeaters is not None and len(result.candidate.repeaters) == 1 and cls._benchmark_is_clean(result) and result.median_ms <= ADAPTIVE_ONE_HOP_MEDIAN_MS and result.worst_ms <= ADAPTIVE_ONE_HOP_WORST_MS
+
+    @staticmethod
     def _find_paths(
         controller_id: int,
         target_id: int,
@@ -948,96 +1065,53 @@ class RouteOptimizer:
         return graph, warnings
 
     def _candidate_list(
-        self,
-        node_id: int,
-        controller_id: int,
-        graph: dict[int, set[int]],
-        nodes: dict[int, Any],
-        previous: PriorityState,
-        *,
-        max_repeaters: int,
-        max_candidates: int,
-        include_auto: bool,
+        self, node_id: int, controller_id: int, graph: dict[int, set[int]], nodes: dict[int, Any], previous: PriorityState, *, max_repeaters: int, max_candidates: int, include_auto: bool, adaptive_testing: bool,
     ) -> list[Candidate]:
-        """Build a bounded, hop-diverse candidate list.
-
-        Existing/current and AUTO baselines are not charged against the generated
-        route budget. Generated slots are interleaved across hop depths so a dense
-        set of one-hop routes cannot starve two-hop candidates. Within each depth,
-        the fastest common speed for every distinct path is considered before a
-        second speed for the same path.
-        """
+        """Build a bounded candidate list with optional passive RF prioritization."""
         candidates: list[Candidate] = []
-
-        # Preserve a clean baseline: test an existing application priority
-        # route before AUTO can change which learned LWR/NLWR is active.
         current = previous.application
         if current:
+            if adaptive_testing and current.repeaters is not None:
+                rf_score, rf_evidence = self._rf_path_hint(current.repeaters, node_id, nodes, controller_id)
+                current = Candidate(current.repeaters, current.speed, current.label, rf_score, rf_evidence)
             candidates.append(current)
-
         if include_auto:
             candidates.append(Candidate(None, None, "AUTO"))
-
-        # Ask for substantially more topology paths than the final candidate
-        # budget so route-depth balancing has something to work with.
-        paths = self._find_paths(
-            controller_id,
-            node_id,
-            graph,
-            nodes,
-            max_repeaters=max_repeaters,
-            max_paths=max(max_candidates * 4, max_candidates),
-        )
-
-        by_depth: dict[int, list[tuple[tuple[int, ...], list[int]]]] = {}
+        paths = self._find_paths(controller_id, node_id, graph, nodes, max_repeaters=max_repeaters, max_paths=max(max_candidates * 4, max_candidates))
+        by_depth: dict[int, list[tuple[tuple[int, ...], list[int], float, tuple[str, ...]]]] = {}
         for repeaters in paths:
-            path_nodes = (controller_id, *repeaters, node_id)
-            speeds = self._common_speeds(path_nodes, nodes)
+            speeds = self._common_speeds((controller_id, *repeaters, node_id), nodes)
             if not speeds:
                 continue
-            by_depth.setdefault(len(repeaters), []).append((repeaters, speeds))
-
-        # Turn each depth into a path-diverse queue: first speed for every path,
-        # then second speed for every path, etc.
+            rf_score, rf_evidence = self._rf_path_hint(repeaters, node_id, nodes, controller_id) if adaptive_testing else (0.0, ())
+            by_depth.setdefault(len(repeaters), []).append((repeaters, speeds, rf_score, rf_evidence))
+        if adaptive_testing:
+            for specs in by_depth.values():
+                specs.sort(key=lambda item: (-item[2], item[0]))
         depth_queues: dict[int, deque[Candidate]] = {}
-        for depth, route_specs in sorted(by_depth.items()):
+        for depth, specs in sorted(by_depth.items()):
             queue: deque[Candidate] = deque()
-            max_speed_count = max(len(speeds) for _, speeds in route_specs)
+            max_speed_count = max(len(speeds) for _, speeds, _, _ in specs)
             for speed_index in range(max_speed_count):
-                for repeaters, speeds in route_specs:
+                for repeaters, speeds, rf_score, rf_evidence in specs:
                     if speed_index >= len(speeds):
                         continue
                     speed = speeds[speed_index]
-                    queue.append(
-                        Candidate(
-                            repeaters=repeaters,
-                            speed=speed,
-                            label=self._route_label(repeaters, speed),
-                        )
-                    )
+                    queue.append(Candidate(repeaters, speed, self._route_label(repeaters, speed), rf_score, rf_evidence))
             depth_queues[depth] = queue
-
-        # Round-robin across route depths. If max_repeaters=2 and all depths
-        # exist, slots are roughly 0-hop, 1-hop, 2-hop, 0-hop, 1-hop, 2-hop...
         generated: list[Candidate] = []
         active_depths = deque(depth for depth in sorted(depth_queues) if depth_queues[depth])
         while active_depths and len(generated) < max_candidates:
-            depth = active_depths.popleft()
-            queue = depth_queues[depth]
-            generated.append(queue.popleft())
-            if queue:
-                active_depths.append(depth)
-
+            depth = active_depths.popleft(); queue = depth_queues[depth]; generated.append(queue.popleft())
+            if queue: active_depths.append(depth)
+        if adaptive_testing:
+            generated = [candidate for _, candidate in sorted(enumerate(generated), key=lambda item: (len(item[1].repeaters or ()), item[0]))]
         candidates.extend(generated)
-
-        unique: list[Candidate] = []
-        seen: set[tuple[Any, Any]] = set()
+        unique: list[Candidate] = []; seen: set[tuple[Any, Any]] = set()
         for candidate in candidates:
-            key = (candidate.repeaters, candidate.speed)
-            if key in seen:
-                continue
-            seen.add(key)
-            unique.append(candidate)
+            key=(candidate.repeaters,candidate.speed)
+            if key in seen: continue
+            seen.add(key); unique.append(candidate)
         return unique
 
     async def _ping_sample(self, node: Any) -> tuple[bool, float]:
@@ -1228,6 +1302,7 @@ class RouteOptimizer:
         min_improvement: float,
         settle_seconds: float,
         include_auto: bool,
+        adaptive_testing: bool,
         defer_apply: bool,
     ) -> tuple[dict[str, Any], Candidate | None, PriorityState]:
         """Optimize one node and always restore it before returning."""
@@ -1243,6 +1318,7 @@ class RouteOptimizer:
             max_repeaters=max_repeaters,
             max_candidates=max_candidates,
             include_auto=include_auto,
+            adaptive_testing=adaptive_testing,
         )
 
         result_data: dict[str, Any] = {
@@ -1262,6 +1338,17 @@ class RouteOptimizer:
                 "flirs_wakeup_samples_scored": False,
                 "slow_sample_threshold_basis": "best_known_device_median_x4_min_250ms",
                 "early_elimination": True,
+                "adaptive_testing": adaptive_testing,
+            },
+            "candidate_strategy": {
+                "adaptive_testing": adaptive_testing,
+                "rf_ranking": "passive_zwave_js_statistics" if adaptive_testing else "disabled",
+                "hard_rssi_filtering": False,
+                "direct_short_circuit": {"median_ms": ADAPTIVE_DIRECT_MEDIAN_MS, "worst_ms": ADAPTIVE_DIRECT_WORST_MS},
+                "one_hop_short_circuit": {"paths_before_decision": ADAPTIVE_ONE_HOP_PATHS, "median_ms": ADAPTIVE_ONE_HOP_MEDIAN_MS, "worst_ms": ADAPTIVE_ONE_HOP_WORST_MS},
+                "planned_candidates": len(candidates),
+                "rf_ranked_candidates": sum(bool(candidate.rf_evidence) for candidate in candidates),
+                "tested_candidates": 0, "skipped_candidates": 0, "stop_reason": None, "untested": [],
             },
             "return_route_state": await self._get_cached_return_route_state(
                 client, node_id
@@ -1278,46 +1365,36 @@ class RouteOptimizer:
         candidate_records: list[BenchResult | dict[str, Any]] = []
         winner: BenchResult | None = None
         replacement_inconclusive = False
+        adaptive_stop_reason: str | None = None
+        baseline_candidate_count = (1 if previous.application is not None else 0) + (1 if include_auto else 0)
+        generated_candidates = candidates[baseline_candidate_count:]
+        one_hop_paths_planned = {c.repeaters for c in generated_candidates if c.repeaters is not None and len(c.repeaters) == 1}
+        one_hop_paths_needed = min(ADAPTIVE_ONE_HOP_PATHS, len(one_hop_paths_planned))
+        one_hop_paths_tested: set[tuple[int, ...]] = set()
         try:
             for candidate_index, candidate in enumerate(candidates, start=1):
                 baseline = self._derive_device_baseline(results)
-                self._update_status(
-                    phase="benchmark",
-                    current_node_id=node_id,
-                    current_node_name=node_name,
-                    candidate_index=candidate_index,
-                    candidate_total=len(candidates),
-                    current_route=candidate.label,
-                )
+                self._update_status(phase="benchmark", current_node_id=node_id, current_node_name=node_name, candidate_index=candidate_index, candidate_total=len(candidates), current_route=candidate.label)
                 try:
-                    benchmark = await self._benchmark(
-                        client,
-                        node,
-                        candidate,
-                        rounds=rounds,
-                        warmup=warmup,
-                        settle_seconds=settle_seconds,
-                        baseline_median_ms=baseline,
-                    )
+                    benchmark = await self._benchmark(client, node, candidate, rounds=rounds, warmup=warmup, settle_seconds=settle_seconds, baseline_median_ms=baseline)
                 except asyncio.CancelledError:
                     raise
                 except Exception as err:
-                    candidate_records.append(
-                        {
-                            "route": candidate.label,
-                            "repeaters": (
-                                None
-                                if candidate.repeaters is None
-                                else list(candidate.repeaters)
-                            ),
-                            "route_speed": candidate.speed,
-                            "route_speed_kbps": self._route_speed_kbps(candidate.speed),
-                            "error": str(err),
-                        }
-                    )
+                    candidate_records.append({"route": candidate.label, "repeaters": None if candidate.repeaters is None else list(candidate.repeaters), "route_speed": candidate.speed, "route_speed_kbps": self._route_speed_kbps(candidate.speed), "rf_score": round(candidate.rf_score,1), "rf_evidence": list(candidate.rf_evidence), "error": str(err)})
                     continue
-                results.append(benchmark)
-                candidate_records.append(benchmark)
+                results.append(benchmark); candidate_records.append(benchmark)
+                if not adaptive_testing or candidate_index <= baseline_candidate_count:
+                    continue
+                if self._excellent_direct(benchmark):
+                    adaptive_stop_reason = f"excellent direct route confirmed ({benchmark.median_ms:.1f} ms median, {benchmark.worst_ms:.1f} ms worst)"; break
+                if candidate.repeaters is not None and len(candidate.repeaters) == 1:
+                    one_hop_paths_tested.add(candidate.repeaters)
+                    if one_hop_paths_needed > 0 and len(one_hop_paths_tested) >= one_hop_paths_needed:
+                        clean = [r for r in results if r.candidate.repeaters is not None and len(r.candidate.repeaters)==1 and self._benchmark_is_clean(r)]
+                        if clean:
+                            best_one_hop=min(clean,key=lambda r:(r.median_ms,r.worst_ms,r.score))
+                            if self._excellent_one_hop(best_one_hop):
+                                adaptive_stop_reason=f"excellent one-hop route confirmed after {len(one_hop_paths_tested)} RF-ranked paths ({best_one_hop.candidate.label}: {best_one_hop.median_ms:.1f} ms median)"; break
 
             if results:
                 baseline = self._derive_device_baseline(results)
@@ -1433,6 +1510,12 @@ class RouteOptimizer:
                 raise RouteRestoreError(
                     f"Failed to restore the starting priority route for node {node_id}: {err}"
                 ) from err
+
+        result_data["candidate_strategy"]["tested_candidates"] = len(candidate_records)
+        result_data["candidate_strategy"]["skipped_candidates"] = max(0, len(candidates)-len(candidate_records))
+        result_data["candidate_strategy"]["stop_reason"] = adaptive_stop_reason
+        if len(candidate_records) < len(candidates):
+            result_data["candidate_strategy"]["untested"] = [{"route": c.label, "rf_score": round(c.rf_score,1), "rf_evidence": list(c.rf_evidence)} for c in candidates[len(candidate_records):]]
 
         # Re-render benchmark records only after the common device baseline is
         # known, otherwise early candidates would retain self-relative slow counts.
@@ -1599,6 +1682,7 @@ class RouteOptimizer:
         min_improvement: float,
         settle_seconds: float,
         include_auto: bool,
+        adaptive_testing: bool,
         refresh_neighbors: bool,
     ) -> dict[str, Any]:
         """Optimize a single node."""
@@ -1647,6 +1731,7 @@ class RouteOptimizer:
                     min_improvement=min_improvement,
                     settle_seconds=settle_seconds,
                     include_auto=include_auto,
+                    adaptive_testing=adaptive_testing,
                     defer_apply=False,
                 )
                 latest = self._compact_latest_result(result)
@@ -1690,6 +1775,12 @@ class RouteOptimizer:
             compact["median_ms"] = best.get("median_ms")
             compact["failures"] = best.get("failures")
             compact["slow_samples"] = best.get("slow_samples")
+        strategy = result.get("candidate_strategy")
+        if isinstance(strategy, dict):
+            compact["tested_candidates"] = strategy.get("tested_candidates")
+            compact["skipped_candidates"] = strategy.get("skipped_candidates")
+            if strategy.get("stop_reason"):
+                compact["adaptive_stop_reason"] = strategy.get("stop_reason")
         if result.get("error"):
             compact["error"] = result.get("error")
         return compact
@@ -1708,13 +1799,14 @@ class RouteOptimizer:
         min_improvement: float,
         settle_seconds: float,
         include_auto: bool,
+        adaptive_testing: bool,
         refresh_neighbors: bool,
     ) -> dict[str, Any]:
         """Benchmark the whole eligible mesh without committing route changes."""
-        # v0.7.1 deliberately keeps whole-network writes behind a hard guard.
+        # v0.7.2 deliberately keeps whole-network writes behind a hard guard.
         if apply or apply_return_route:
             raise HomeAssistantError(
-                "Whole-network Apply is intentionally disabled in v0.7.1. "
+                "Whole-network Apply is intentionally disabled in v0.7.2. "
                 "Run Optimize Z-Wave network with both apply toggles off; use "
                 "single-node optimization for deliberate route writes."
             )
@@ -1815,6 +1907,7 @@ class RouteOptimizer:
                                 min_improvement=min_improvement,
                                 settle_seconds=settle_seconds,
                                 include_auto=include_auto,
+                                adaptive_testing=adaptive_testing,
                                 defer_apply=True,
                             )
                         except (asyncio.CancelledError, RouteRestoreError):
@@ -1859,6 +1952,7 @@ class RouteOptimizer:
                     "eligible_nodes": len(targets),
                     "completed_nodes": len(final_results),
                     "completed_node_runs": completed_node_runs,
+                    "adaptive_testing": adaptive_testing,
                     "skipped_node_ids": [item["node_id"] for item in skipped_nodes],
                     "skipped_nodes": skipped_nodes,
                     "warnings": warnings,
