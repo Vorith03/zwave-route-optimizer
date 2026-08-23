@@ -1,0 +1,27 @@
+name: Complete repository seed
+
+on:
+  push:
+    paths:
+      - '.seed/READY'
+
+permissions:
+  contents: write
+
+jobs:
+  assemble:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Assemble large source file
+        run: |
+          set -euo pipefail
+          cat .seed/optimizer.py.part* > custom_components/zwave_route_optimizer/optimizer.py
+          rm -rf .seed
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Complete v0.7.0 repository seed"
+          git push
