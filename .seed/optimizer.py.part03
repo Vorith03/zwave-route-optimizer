@@ -1,0 +1,320 @@
+        the fastest common speed for every distinct path is considered before a
+        second speed for the same path.
+        """
+        candidates: list[Candidate] = []
+
+        # Preserve a clean baseline: test an existing application priority
+        # route before AUTO can change which learned LWR/NLWR is active.
+        current = previous.application
+        if current:
+            candidates.append(current)
+
+        if include_auto:
+            candidates.append(Candidate(None, None, "AUTO"))
+
+        # Ask for substantially more topology paths than the final candidate
+        # budget so route-depth balancing has something to work with.
+        paths = self._find_paths(
+            controller_id,
+            node_id,
+            graph,
+            nodes,
+            max_repeaters=max_repeaters,
+            max_paths=max(max_candidates * 4, max_candidates),
+        )
+
+        by_depth: dict[int, list[tuple[tuple[int, ...], list[int]]]] = {}
+        for repeaters in paths:
+            path_nodes = (controller_id, *repeaters, node_id)
+            speeds = self._common_speeds(path_nodes, nodes)
+            if not speeds:
+                continue
+            by_depth.setdefault(len(repeaters), []).append((repeaters, speeds))
+
+        # Turn each depth into a path-diverse queue: first speed for every path,
+        # then second speed for every path, etc.
+        depth_queues: dict[int, deque[Candidate]] = {}
+        for depth, route_specs in sorted(by_depth.items()):
+            queue: deque[Candidate] = deque()
+            max_speed_count = max(len(speeds) for _, speeds in route_specs)
+            for speed_index in range(max_speed_count):
+                for repeaters, speeds in route_specs:
+                    if speed_index >= len(speeds):
+                        continue
+                    speed = speeds[speed_index]
+                    queue.append(
+                        Candidate(
+                            repeaters=repeaters,
+                            speed=speed,
+                            label=self._route_label(repeaters, speed),
+                        )
+                    )
+            depth_queues[depth] = queue
+
+        # Round-robin across route depths. If max_repeaters=2 and all depths
+        # exist, slots are roughly 0-hop, 1-hop, 2-hop, 0-hop, 1-hop, 2-hop...
+        generated: list[Candidate] = []
+        active_depths = deque(depth for depth in sorted(depth_queues) if depth_queues[depth])
+        while active_depths and len(generated) < max_candidates:
+            depth = active_depths.popleft()
+            queue = depth_queues[depth]
+            generated.append(queue.popleft())
+            if queue:
+                active_depths.append(depth)
+
+        candidates.extend(generated)
+
+        unique: list[Candidate] = []
+        seen: set[tuple[Any, Any]] = set()
+        for candidate in candidates:
+            key = (candidate.repeaters, candidate.speed)
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(candidate)
+        return unique
+
+    async def _ping_sample(self, node: Any) -> tuple[bool, float]:
+        """Measure one Z-Wave JS ping without adding a second timeout layer."""
+        started = time.monotonic()
+        try:
+            responded = bool(await node.async_ping())
+        except Exception:
+            responded = False
+        elapsed = (time.monotonic() - started) * 1000.0
+        return responded, elapsed
+
+    async def _benchmark(
+        self,
+        client: Any,
+        node: Any,
+        candidate: Candidate,
+        *,
+        rounds: int,
+        warmup: int,
+        settle_seconds: float,
+        baseline_median_ms: float | None = None,
+    ) -> BenchResult:
+        """Benchmark one candidate's routing quality.
+
+        FLiRS sleep/wake timing is intentionally excluded from the score.
+        At least one unscored ping wakes a FLiRS device, then measured probes
+        are sent closely together so they primarily measure the route.
+
+        Early elimination is intentionally conservative: repeated transaction
+        failures stop immediately, while latency-only elimination requires an
+        already established device baseline plus several clearly pathological
+        scored samples.
+        """
+        await self._ensure_network_safe_to_test(check_ota=False)
+        await self._apply_candidate(client, node.node_id, candidate)
+        await asyncio.sleep(settle_seconds)
+
+        warmup_count = max(warmup, 1 if self._is_flirs(node) else 0)
+        warmup_samples: list[float] = []
+        wake_failures = 0
+        for _ in range(warmup_count):
+            responded, elapsed = await self._ping_sample(node)
+            warmup_samples.append(elapsed)
+            if self._is_flirs(node) and not responded:
+                wake_failures += 1
+            await asyncio.sleep(DEFAULT_SAMPLE_INTERVAL)
+
+        samples: list[float] = []
+        failures = 0
+        stopped_early = False
+        stop_reason: str | None = None
+        slow_threshold = (
+            max(250.0, baseline_median_ms * 4.0)
+            if baseline_median_ms is not None
+            else None
+        )
+
+        for index in range(rounds):
+            responded, elapsed = await self._ping_sample(node)
+            samples.append(elapsed)
+            if not responded:
+                failures += 1
+
+            if failures >= 2:
+                stopped_early = True
+                stop_reason = "two transaction failures"
+                break
+
+            if slow_threshold is not None and len(samples) >= 3:
+                slow_count = sum(value > slow_threshold for value in samples)
+                current_median = statistics.median(samples)
+                if slow_count >= 2 and current_median > slow_threshold:
+                    stopped_early = True
+                    stop_reason = (
+                        "latency clearly worse than established device baseline "
+                        f"({slow_count}/{len(samples)} samples > {slow_threshold:.0f} ms)"
+                    )
+                    break
+
+            if index + 1 < rounds:
+                await asyncio.sleep(DEFAULT_SAMPLE_INTERVAL)
+
+        return BenchResult(
+            candidate=candidate,
+            samples_ms=samples,
+            failures=failures,
+            warmup_samples_ms=warmup_samples,
+            wake_failures=wake_failures,
+            baseline_median_ms=baseline_median_ms,
+            stopped_early=stopped_early,
+            stop_reason=stop_reason,
+            planned_rounds=rounds,
+        )
+
+    @staticmethod
+    def _derive_device_baseline(results: list[BenchResult]) -> float | None:
+        """Return the best-known device latency baseline without self-inflation."""
+        finite = [result for result in results if math.isfinite(result.median_ms)]
+        if not finite:
+            return None
+        clean = [
+            result
+            for result in finite
+            if result.failures == 0 and result.wake_failures == 0
+        ]
+        pool = clean or finite
+        return min(result.median_ms for result in pool)
+
+    @staticmethod
+    def _apply_device_baseline(
+        results: list[BenchResult], baseline_median_ms: float | None
+    ) -> None:
+        """Apply one common slow-sample baseline to every candidate result."""
+        for result in results:
+            result.baseline_median_ms = baseline_median_ms
+
+    @staticmethod
+    def _choose_winner(
+        results: list[BenchResult],
+        previous: PriorityState,
+        min_improvement: float,
+    ) -> BenchResult:
+        """Choose the best route while avoiding unnecessary route churn."""
+        raw_best = min(
+            results,
+            key=lambda item: (
+                item.failures,
+                item.wake_failures,
+                item.slow_samples,
+                item.median_ms,
+                item.worst_ms,
+                item.score,
+            ),
+        )
+        tolerance = 1.0 + min_improvement / 100.0
+
+        def near_equal(result: BenchResult) -> bool:
+            return (
+                result.failures == raw_best.failures
+                and result.wake_failures == raw_best.wake_failures
+                and result.slow_samples == raw_best.slow_samples
+                and result.median_ms <= raw_best.median_ms * tolerance
+                and result.worst_ms <= max(
+                    raw_best.worst_ms * tolerance,
+                    raw_best.worst_ms + 15.0,
+                )
+            )
+
+        current = previous.application
+        if current is not None:
+            for result in results:
+                if (
+                    result.candidate.repeaters == current.repeaters
+                    and result.candidate.speed == current.speed
+                    and near_equal(result)
+                ):
+                    return result
+
+        # If AUTO is really equivalent, prefer not to pin anything.
+        for result in results:
+            if result.candidate.is_auto and near_equal(result):
+                return result
+
+        return raw_best
+
+    @staticmethod
+    def _same_candidate(left: Candidate | None, right: Candidate | None) -> bool:
+        """Return whether two route candidates describe the same route."""
+        if left is None or right is None:
+            return left is right
+        return left.repeaters == right.repeaters and left.speed == right.speed
+
+    async def _optimize_one(
+        self,
+        *,
+        client: Any,
+        controller: Any,
+        graph: dict[int, set[int]],
+        node: Any,
+        apply: bool,
+        apply_return_route: bool,
+        allow_unvalidated_return_route: bool,
+        rounds: int,
+        warmup: int,
+        max_repeaters: int,
+        max_candidates: int,
+        min_improvement: float,
+        settle_seconds: float,
+        include_auto: bool,
+        defer_apply: bool,
+    ) -> tuple[dict[str, Any], Candidate | None, PriorityState]:
+        """Optimize one node and always restore it before returning."""
+        node_id = node.node_id
+        node_name = node.data.get("name") or f"Node {node_id}"
+        previous = await self._get_priority_state(client, node_id)
+        candidates = self._candidate_list(
+            node_id,
+            controller.own_node_id,
+            graph,
+            controller.nodes,
+            previous,
+            max_repeaters=max_repeaters,
+            max_candidates=max_candidates,
+            include_auto=include_auto,
+        )
+
+        result_data: dict[str, Any] = {
+            "node_id": node_id,
+            "name": node_name,
+            "applied": False,
+            "applied_forward_route": False,
+            "applied_return_route": False,
+            "starting_priority_state": previous.as_dict(),
+            "sampling": {
+                "mode": (
+                    "flirs_warm_then_route_probes"
+                    if self._is_flirs(node)
+                    else "continuous_route_probes"
+                ),
+                "scored_probe_interval_seconds": DEFAULT_SAMPLE_INTERVAL,
+                "flirs_wakeup_samples_scored": False,
+                "slow_sample_threshold_basis": "best_known_device_median_x4_min_250ms",
+                "early_elimination": True,
+            },
+            "return_route_state": await self._get_cached_return_route_state(
+                client, node_id
+            ),
+            "candidates": [],
+            "confirmation": None,
+        }
+
+        if not candidates:
+            result_data["status"] = "no_candidates"
+            return result_data, None, previous
+
+        results: list[BenchResult] = []
+        candidate_records: list[BenchResult | dict[str, Any]] = []
+        winner: BenchResult | None = None
+        replacement_inconclusive = False
+        try:
+            for candidate_index, candidate in enumerate(candidates, start=1):
+                baseline = self._derive_device_baseline(results)
+                self._update_status(
+                    phase="benchmark",
+                    current_node_id=node_id,
