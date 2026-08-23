@@ -1,0 +1,553 @@
+--- a/custom_components/zwave_route_optimizer/const.py
++++ b/custom_components/zwave_route_optimizer/const.py
+@@ -20,6 +20,11 @@ ADAPTIVE_DIRECT_WORST_MS = 75.0
+ ADAPTIVE_ONE_HOP_MEDIAN_MS = 45.0
+ ADAPTIVE_ONE_HOP_WORST_MS = 100.0
+ ADAPTIVE_ONE_HOP_PATHS = 3
++ADAPTIVE_INCUMBENT_MEDIAN_MS = 60.0
++ADAPTIVE_INCUMBENT_WORST_MS = 150.0
++ADAPTIVE_INCUMBENT_CHALLENGER_PATHS = 3
++ADAPTIVE_LEARNED_ROUTE_WEAK_WEIGHT = 0.20
++ADAPTIVE_LEARNED_ROUTE_STRONG_WEIGHT = 1.0
+ 
+ # Z-Wave Serial API route-speed values. These are *not* bit rates:
+ #   1 = 9.6 kbit/s, 2 = 40 kbit/s, 3 = 100 kbit/s
+--- a/custom_components/zwave_route_optimizer/optimizer.py
++++ b/custom_components/zwave_route_optimizer/optimizer.py
+@@ -15,6 +15,11 @@ from homeassistant.exceptions import HomeAssistantError
+ from .const import (
+     ADAPTIVE_DIRECT_MEDIAN_MS,
+     ADAPTIVE_DIRECT_WORST_MS,
++    ADAPTIVE_INCUMBENT_CHALLENGER_PATHS,
++    ADAPTIVE_INCUMBENT_MEDIAN_MS,
++    ADAPTIVE_INCUMBENT_WORST_MS,
++    ADAPTIVE_LEARNED_ROUTE_STRONG_WEIGHT,
++    ADAPTIVE_LEARNED_ROUTE_WEAK_WEIGHT,
+     ADAPTIVE_ONE_HOP_MEDIAN_MS,
+     ADAPTIVE_ONE_HOP_PATHS,
+     ADAPTIVE_ONE_HOP_WORST_MS,
+@@ -879,8 +884,16 @@ class RouteOptimizer:
+         return max(values) if values else None
+ 
+     @classmethod
+-    def _rf_path_hint(cls, repeaters: tuple[int, ...], target_id: int, nodes: dict[int, Any], controller_id: int) -> tuple[float, tuple[str, ...]]:
+-        """Rank a path using passive RF/history hints without hard-filtering it."""
++    def _rf_path_hint(
++        cls,
++        repeaters: tuple[int, ...],
++        target_id: int,
++        nodes: dict[int, Any],
++        controller_id: int,
++        *,
++        learned_route_weight: float = ADAPTIVE_LEARNED_ROUTE_WEAK_WEIGHT,
++    ) -> tuple[float, tuple[str, ...]]:
++        """Rank a path using passive RF/history hints without hard-filtering it.
++
++        Learned LWR/NLWR history is deliberately weighted separately from direct
++        RSSI evidence. A poor AUTO baseline can therefore disable learned-route
++        favoritism instead of reinforcing a route we are trying to escape.
++        """
+         score = 0.0
+         evidence: list[str] = []
+         target = nodes.get(target_id)
+@@ -908,21 +921,23 @@ class RouteOptimizer:
+             except (TypeError, ValueError):
+                 continue
+             if learned == repeaters:
+-                score += exact_bonus
+-                evidence.append(f"matches_{route_name}")
++                score += exact_bonus * learned_route_weight
++                evidence.append(
++                    f"matches_{route_name}(weight={learned_route_weight:g})"
++                )
+             elif repeaters and any(value in learned for value in repeaters):
+                 overlap = len(set(repeaters) & set(learned))
+-                score += 12.0 * overlap
+-                evidence.append(f"overlaps_{route_name}={overlap}")
++                score += 12.0 * overlap * learned_route_weight
++                evidence.append(
++                    f"overlaps_{route_name}={overlap}(weight={learned_route_weight:g})"
++                )
+             if learned == repeaters:
+                 link_rssi: list[float] = []
+                 route_rssi = cls._valid_rssi(route.get("rssi"))
+@@ -937,10 +952,84 @@ class RouteOptimizer:
+                         link_rssi.append(normalized)
+                 if link_rssi:
+                     weakest = min(link_rssi)
+-                    score += max(0.0, min(35.0, weakest + 110.0))
++                    score += (
++                        max(0.0, min(35.0, weakest + 110.0))
++                        * learned_route_weight
++                    )
+                     evidence.append(f"{route_name}_weakest_rssi={weakest:g}dBm")
+         return score, tuple(evidence)
+ 
++    @classmethod
++    def _auto_history_weight(cls, auto_result: BenchResult | None) -> float:
++        """Return how much learned-route history should influence candidate order."""
++        if auto_result is None:
++            return ADAPTIVE_LEARNED_ROUTE_WEAK_WEIGHT
++        if (
++            cls._benchmark_is_clean(auto_result)
++            and auto_result.median_ms <= ADAPTIVE_ONE_HOP_MEDIAN_MS
++            and auto_result.worst_ms <= ADAPTIVE_ONE_HOP_WORST_MS
++        ):
++            return ADAPTIVE_LEARNED_ROUTE_STRONG_WEIGHT
++        return 0.0
++
++    @classmethod
++    def _rerank_generated_candidates(
++        cls,
++        candidates: list[Candidate],
++        *,
++        target_id: int,
++        nodes: dict[int, Any],
++        controller_id: int,
++        learned_route_weight: float,
++    ) -> list[Candidate]:
++        """Refresh RF scores after baseline testing while preserving path diversity."""
++        grouped: dict[int, dict[tuple[int, ...], list[Candidate]]] = {}
++        for candidate in candidates:
++            if candidate.repeaters is None:
++                continue
++            rf_score, rf_evidence = cls._rf_path_hint(
++                candidate.repeaters,
++                target_id,
++                nodes,
++                controller_id,
++                learned_route_weight=learned_route_weight,
++            )
++            refreshed = Candidate(
++                candidate.repeaters,
++                candidate.speed,
++                candidate.label,
++                rf_score,
++                rf_evidence,
++            )
++            grouped.setdefault(len(candidate.repeaters), {}).setdefault(
++                candidate.repeaters, []
++            ).append(refreshed)
++
++        ordered: list[Candidate] = []
++        for depth in sorted(grouped):
++            path_variants = list(grouped[depth].values())
++            path_variants.sort(
++                key=lambda variants: (
++                    -variants[0].rf_score,
++                    variants[0].repeaters or (),
++                )
++            )
++            max_variants = max(len(variants) for variants in path_variants)
++            for variant_index in range(max_variants):
++                for variants in path_variants:
++                    if variant_index < len(variants):
++                        ordered.append(variants[variant_index])
++        return ordered
++
+     @staticmethod
+     def _benchmark_is_clean(result: BenchResult) -> bool:
+         return result.failures == 0 and result.wake_failures == 0 and result.slow_samples == 0 and math.isfinite(result.median_ms) and math.isfinite(result.worst_ms)
+@@ -954,6 +1043,10 @@ class RouteOptimizer:
+     def _excellent_one_hop(cls, result: BenchResult) -> bool:
+         return result.candidate.repeaters is not None and len(result.candidate.repeaters) == 1 and cls._benchmark_is_clean(result) and result.median_ms <= ADAPTIVE_ONE_HOP_MEDIAN_MS and result.worst_ms <= ADAPTIVE_ONE_HOP_WORST_MS
+ 
++    @classmethod
++    def _excellent_incumbent(cls, result: BenchResult) -> bool:
++        return cls._benchmark_is_clean(result) and result.median_ms <= ADAPTIVE_INCUMBENT_MEDIAN_MS and result.worst_ms <= ADAPTIVE_INCUMBENT_WORST_MS
++
+     @staticmethod
+     def _find_paths(
+         controller_id: int,
+@@ -1347,9 +1440,19 @@ class RouteOptimizer:
+                 "adaptive_testing": adaptive_testing,
+                 "rf_ranking": "passive_zwave_js_statistics" if adaptive_testing else "disabled",
+                 "hard_rssi_filtering": False,
++                "learned_route_policy": "strong_only_when_auto_is_clean_and_fast",
++                "learned_route_weight_initial": ADAPTIVE_LEARNED_ROUTE_WEAK_WEIGHT,
++                "learned_route_weight_after_baseline": None,
+                 "direct_short_circuit": {"median_ms": ADAPTIVE_DIRECT_MEDIAN_MS, "worst_ms": ADAPTIVE_DIRECT_WORST_MS},
+                 "one_hop_short_circuit": {"paths_before_decision": ADAPTIVE_ONE_HOP_PATHS, "median_ms": ADAPTIVE_ONE_HOP_MEDIAN_MS, "worst_ms": ADAPTIVE_ONE_HOP_WORST_MS},
++                "incumbent_short_circuit": {
++                    "challenger_paths_before_decision": ADAPTIVE_INCUMBENT_CHALLENGER_PATHS,
++                    "incumbent_median_ms": ADAPTIVE_INCUMBENT_MEDIAN_MS,
++                    "incumbent_worst_ms": ADAPTIVE_INCUMBENT_WORST_MS,
++                },
+                 "planned_candidates": len(candidates),
+                 "rf_ranked_candidates": sum(bool(candidate.rf_evidence) for candidate in candidates),
+                 "tested_candidates": 0, "skipped_candidates": 0, "stop_reason": None, "untested": [],
+@@ -1369,12 +1472,14 @@ class RouteOptimizer:
+         winner: BenchResult | None = None
+         replacement_inconclusive = False
+         adaptive_stop_reason: str | None = None
++        learned_route_weight = ADAPTIVE_LEARNED_ROUTE_WEAK_WEIGHT
+         baseline_candidate_count = (1 if previous.application is not None else 0) + (1 if include_auto else 0)
+         generated_candidates = candidates[baseline_candidate_count:]
+         one_hop_paths_planned = {c.repeaters for c in generated_candidates if c.repeaters is not None and len(c.repeaters) == 1}
+         one_hop_paths_needed = min(ADAPTIVE_ONE_HOP_PATHS, len(one_hop_paths_planned))
+         one_hop_paths_tested: set[tuple[int, ...]] = set()
++        incumbent_challenger_paths_tested: set[tuple[int, ...]] = set()
+         try:
+-            for candidate_index, candidate in enumerate(candidates, start=1):
++            candidate_offset = 0
++            while candidate_offset < len(candidates):
++                candidate = candidates[candidate_offset]
++                candidate_index = candidate_offset + 1
+                 baseline = self._derive_device_baseline(results)
+                 self._update_status(phase="benchmark", current_node_id=node_id, current_node_name=node_name, candidate_index=candidate_index, candidate_total=len(candidates), current_route=candidate.label)
++                benchmark: BenchResult | None = None
+                 try:
+                     benchmark = await self._benchmark(client, node, candidate, rounds=rounds, warmup=warmup, settle_seconds=settle_seconds, baseline_median_ms=baseline)
+                 except asyncio.CancelledError:
+@@ -1382,16 +1487,63 @@ class RouteOptimizer:
+                 except Exception as err:
+                     candidate_records.append({"route": candidate.label, "repeaters": None if candidate.repeaters is None else list(candidate.repeaters), "route_speed": candidate.speed, "route_speed_kbps": self._route_speed_kbps(candidate.speed), "rf_score": round(candidate.rf_score,1), "rf_evidence": list(candidate.rf_evidence), "error": str(err)})
+-                    continue
+-                results.append(benchmark); candidate_records.append(benchmark)
+-                if not adaptive_testing or candidate_index <= baseline_candidate_count:
++                else:
++                    results.append(benchmark)
++                    candidate_records.append(benchmark)
++
++                candidate_offset += 1
++
++                # Once current/AUTO baselines are known, re-rank the untouched
++                # generated routes. Good AUTO performance allows learned history
++                # to matter; poor AUTO performance removes that bonus entirely.
++                if (
++                    adaptive_testing
++                    and baseline_candidate_count > 0
++                    and candidate_offset == baseline_candidate_count
++                ):
++                    auto_result = next(
++                        (result for result in results if result.candidate.is_auto),
++                        None,
++                    )
++                    learned_route_weight = self._auto_history_weight(auto_result)
++                    reranked = self._rerank_generated_candidates(
++                        candidates[baseline_candidate_count:],
++                        target_id=node_id,
++                        nodes=controller.nodes,
++                        controller_id=controller.own_node_id,
++                        learned_route_weight=learned_route_weight,
++                    )
++                    candidates[baseline_candidate_count:] = reranked
++                    generated_candidates = reranked
++                    one_hop_paths_planned = {
++                        item.repeaters
++                        for item in generated_candidates
++                        if item.repeaters is not None and len(item.repeaters) == 1
++                    }
++                    one_hop_paths_needed = min(
++                        ADAPTIVE_ONE_HOP_PATHS, len(one_hop_paths_planned)
++                    )
++                    result_data["candidate_strategy"][
++                        "learned_route_weight_after_baseline"
++                    ] = learned_route_weight
++                    result_data["candidate_strategy"]["rf_ranked_candidates"] = sum(
++                        bool(item.rf_evidence) for item in candidates
++                    )
++
++                if benchmark is None:
++                    continue
++                if not adaptive_testing or candidate_index <= baseline_candidate_count:
+                     continue
++
++                if candidate.repeaters is not None:
++                    incumbent_challenger_paths_tested.add(candidate.repeaters)
++
+                 if self._excellent_direct(benchmark):
+                     adaptive_stop_reason = f"excellent direct route confirmed ({benchmark.median_ms:.1f} ms median, {benchmark.worst_ms:.1f} ms worst)"; break
++
++                incumbent = previous.application
++                if (
++                    incumbent is not None
++                    and len(incumbent_challenger_paths_tested)
++                    >= ADAPTIVE_INCUMBENT_CHALLENGER_PATHS
++                ):
++                    incumbent_result = next(
++                        (
++                            result
++                            for result in results
++                            if self._same_candidate(result.candidate, incumbent)
++                        ),
++                        None,
++                    )
++                    if incumbent_result is not None and self._excellent_incumbent(
++                        incumbent_result
++                    ):
++                        provisional = self._choose_winner(
++                            results, previous, min_improvement
++                        )
++                        if self._same_candidate(provisional.candidate, incumbent):
++                            adaptive_stop_reason = (
++                                "clean incumbent retained after "
++                                f"{len(incumbent_challenger_paths_tested)} RF-ranked "
++                                "challenger paths"
++                            )
++                            break
++
+                 if candidate.repeaters is not None and len(candidate.repeaters) == 1:
+                     one_hop_paths_tested.add(candidate.repeaters)
+                     if one_hop_paths_needed > 0 and len(one_hop_paths_tested) >= one_hop_paths_needed:
+@@ -1770,6 +1922,18 @@ class RouteOptimizer:
+             compact["median_ms"] = best.get("median_ms")
+             compact["failures"] = best.get("failures")
+             compact["slow_samples"] = best.get("slow_samples")
++            compact["best_repeaters"] = best.get("repeaters")
++            compact["best_route_speed"] = best.get("route_speed")
++            compact["best_route_speed_kbps"] = best.get("route_speed_kbps")
++            compact["best_is_auto"] = best.get("repeaters") is None
++        starting = result.get("starting_priority_state")
++        if isinstance(starting, dict):
++            effective = starting.get("effective_route")
++            if isinstance(effective, dict):
++                compact["starting_effective_repeaters"] = effective.get("repeaters")
++                compact["starting_effective_route_speed"] = effective.get(
++                    "routeSpeed"
++                )
++                compact["starting_effective_route_kind"] = effective.get("routeKind")
+         strategy = result.get("candidate_strategy")
+         if isinstance(strategy, dict):
+             compact["tested_candidates"] = strategy.get("tested_candidates")
+@@ -1781,6 +1945,122 @@ class RouteOptimizer:
+             compact["error"] = result.get("error")
+         return compact
+ 
++    @staticmethod
++    def _summary_physical_path(
++        summary: dict[str, Any],
++    ) -> tuple[tuple[int, ...] | None, int | None]:
++        """Normalize an explicit winner or AUTO's starting learned path."""
++        if summary.get("best_is_auto"):
++            repeaters = summary.get("starting_effective_repeaters")
++            speed = summary.get("starting_effective_route_speed")
++        else:
++            repeaters = summary.get("best_repeaters")
++            speed = summary.get("best_route_speed")
++        if not isinstance(repeaters, list):
++            return None, None
++        try:
++            normalized = tuple(int(value) for value in repeaters)
++        except (TypeError, ValueError):
++            return None, None
++        try:
++            speed_int = int(speed) if speed is not None else None
++        except (TypeError, ValueError):
++            speed_int = None
++        return normalized, speed_int
++
++    @classmethod
++    def _build_route_stability(
++        cls,
++        pass_results: list[dict[str, Any]],
++        expected_passes: int,
++    ) -> dict[str, Any]:
++        """Classify exact-winner and physical-path repeatability across passes."""
++        by_node: dict[int, list[dict[str, Any]]] = {}
++        for pass_data in pass_results:
++            pass_index = int(pass_data.get("pass_index", 0))
++            for summary in pass_data.get("results", []):
++                if not isinstance(summary, dict) or summary.get("status") != "ok":
++                    continue
++                node_id = summary.get("node_id")
++                if not isinstance(node_id, int) or not summary.get("best_route"):
++                    continue
++                item = dict(summary)
++                item["pass_index"] = pass_index
++                by_node.setdefault(node_id, []).append(item)
++
++        nodes: list[dict[str, Any]] = []
++        counts: dict[str, int] = {}
++        for node_id in sorted(by_node):
++            winners = sorted(by_node[node_id], key=lambda item: item["pass_index"])
++            exact_signatures = {
++                (
++                    bool(item.get("best_is_auto")),
++                    tuple(item.get("best_repeaters") or ())
++                    if not item.get("best_is_auto")
++                    else None,
++                    item.get("best_route_speed"),
++                )
++                for item in winners
++            }
++            physical = [cls._summary_physical_path(item) for item in winners]
++            physical_paths = [path for path, _ in physical]
++            known_paths = [path for path in physical_paths if path is not None]
++            path_stable = (
++                len(known_paths) == len(winners)
++                and len(set(known_paths)) == 1
++            )
++            exact_stable = len(exact_signatures) == 1
++            all_auto = all(bool(item.get("best_is_auto")) for item in winners)
++
++            if len(winners) < expected_passes:
++                classification = "incomplete"
++                confidence = "insufficient"
++            elif expected_passes <= 1:
++                classification = "single_pass"
++                confidence = "insufficient"
++            elif exact_stable and (not all_auto or path_stable):
++                classification = "exact_stable"
++                confidence = "strong"
++            elif path_stable:
++                classification = "path_stable"
++                confidence = "moderate"
++            elif exact_stable and all_auto:
++                classification = "auto_policy_stable_path_dynamic"
++                confidence = "low"
++            else:
++                classification = "unstable"
++                confidence = "low"
++
++            counts[classification] = counts.get(classification, 0) + 1
++
++            path_counts: dict[tuple[int, ...] | None, int] = {}
++            for path in physical_paths:
++                path_counts[path] = path_counts.get(path, 0) + 1
++            top_path, top_path_count = max(
++                path_counts.items(), key=lambda item: item[1]
++            )
++
++            exact_counts: dict[tuple[Any, ...], int] = {}
++            for signature in exact_signatures:
++                exact_counts[signature] = sum(
++                    1
++                    for item in winners
++                    if (
++                        bool(item.get("best_is_auto")),
++                        tuple(item.get("best_repeaters") or ())
++                        if not item.get("best_is_auto")
++                        else None,
++                        item.get("best_route_speed"),
++                    )
++                    == signature
++                )
++            top_exact_count = max(exact_counts.values()) if exact_counts else 0
++
++            nodes.append(
++                {
++                    "node_id": node_id,
++                    "name": winners[0].get("name"),
++                    "classification": classification,
++                    "confidence": confidence,
++                    "candidate_agreement": f"{top_exact_count}/{expected_passes}",
++                    "physical_path_agreement": f"{top_path_count}/{expected_passes}",
++                    "consensus_path": None if top_path is None else list(top_path),
++                    "pass_winners": [
++                        {
++                            "pass_index": item["pass_index"],
++                            "route": item.get("best_route"),
++                            "median_ms": item.get("median_ms"),
++                        }
++                        for item in winners
++                    ],
++                }
++            )
++
++        return {
++            "passes": expected_passes,
++            "classification_counts": counts,
++            "nodes": nodes,
++        }
++
+     async def optimize_network(
+         self,
+         *,
+@@ -1804,9 +2084,9 @@ class RouteOptimizer:
+         refresh_neighbors: bool,
+     ) -> dict[str, Any]:
+         """Benchmark the whole eligible mesh without committing route changes."""
+-        # v0.7.2 deliberately keeps whole-network writes behind a hard guard.
++        # v0.7.3 deliberately keeps whole-network writes behind a hard guard.
+         if apply or apply_return_route:
+             raise HomeAssistantError(
+-                "Whole-network Apply is intentionally disabled in v0.7.2. "
++                "Whole-network Apply is intentionally disabled in v0.7.3. "
+                 "Run Optimize Z-Wave network with both apply toggles off; use "
+                 "single-node optimization for deliberate route writes."
+             )
+@@ -1924,6 +2204,7 @@ class RouteOptimizer:
+                     "rollback_errors": [],
+                     "applied_node_ids": [],
+                     "passes": pass_results,
++                    "route_stability": self._build_route_stability(pass_results, passes),
+                     "results": final_results,
+                 }
+--- a/custom_components/zwave_route_optimizer/manifest.json
++++ b/custom_components/zwave_route_optimizer/manifest.json
+@@ -1,7 +1,7 @@
+ {
+   "domain": "zwave_route_optimizer",
+   "name": "Z-Wave Route Optimizer",
+-  "version": "0.7.2",
++  "version": "0.7.3",
+   "config_flow": true,
+   "dependencies": [
+     "zwave_js"
+--- a/custom_components/zwave_route_optimizer/services.yaml
++++ b/custom_components/zwave_route_optimizer/services.yaml
+@@ -94,18 +94,18 @@ optimize_network:
+   description: Manually benchmark all eligible classic Z-Wave nodes. Sleeping battery
+     nodes and Z-Wave Long Range nodes are skipped. All nodes are restored to their
+     starting priority-route state while benchmarking. Whole-network writes are
+-    intentionally disabled in v0.7.2.
++    intentionally disabled in v0.7.3.
+   fields:
+     apply:
+-      name: Apply best forward routes (disabled in v0.7.2)
+-      description: Whole-network writes are intentionally blocked in v0.7.2. Leave this off.
++      name: Apply best forward routes (disabled in v0.7.3)
++      description: Whole-network writes are intentionally blocked in v0.7.3. Leave this off.
+       default: false
+       selector:
+         boolean: null
+     apply_return_route:
+-      name: Apply suggested return routes (disabled in v0.7.2)
+-      description: Whole-network return-route writes are intentionally blocked in v0.7.2. Leave this off; dry runs still analyze and report suggestions.
++      name: Apply suggested return routes (disabled in v0.7.3)
++      description: Whole-network return-route writes are intentionally blocked in v0.7.3. Leave this off; dry runs still analyze and report suggestions.
+       default: false
+       selector:
+         boolean: null
+     allow_unvalidated_return_route:
+       name: Allow topology-unvalidated return routes
+-      description: Reserved for future whole-network return-route writes. Dry-run always reports whether the suggested reverse path is topology-validated. Whole-network writes remain disabled in v0.7.2.
++      description: Reserved for future whole-network return-route writes. Dry-run always reports whether the suggested reverse path is topology-validated. Whole-network writes remain disabled in v0.7.3.
+       default: false
+       selector:
+         boolean: null
+--- a/README.md
++++ b/README.md
+@@ -1,6 +1,6 @@
+ # Z-Wave Route Optimizer for Home Assistant
+ 
+-Version: **0.7.2**
++Version: **0.7.3**
+ 
+ A manually invoked Home Assistant custom integration for benchmarking and optionally pinning **classic Z-Wave application priority routes** using Home Assistant's existing Z-Wave JS connection.
+ 
+@@ -32,11 +32,11 @@ If the winning forward route differs from the currently pinned route, applying o
+ 
+ ### Whole-network writes
+ 
+-**Whole-network Apply is intentionally disabled in v0.7.2.**
++**Whole-network Apply is intentionally disabled in v0.7.3.**
+ 
+ The action still exposes the apply controls so the intended UX is visible, but turning either write toggle on causes the action to refuse before benchmarking or modifying the network. Whole-network mode is dry-run only for this release.
+ 
+-## v0.7.2 behavior
++## v0.7.3 behavior
+@@ -51,8 +51,11 @@ The action still exposes the apply controls so the intended UX is visible, but t
+ - Candidate generation is hop-diverse: direct, 1-hop, 2-hop, etc. receive independent path discovery and round-robin candidate slots so shallow routes cannot starve multi-hop routes.
+ - **Adaptive candidate testing is enabled by default.** Passive Z-Wave JS node statistics (RSSI plus recently observed LWR/NLWR routes and repeater RSSI when available) are used only to prioritize topology-valid candidates; they never hard-filter a route.
++- Learned LWR/NLWR history is now conditional: it receives full ranking weight only when the measured AUTO baseline is clean and fast. A poor AUTO baseline removes the learned-route bonus so the optimizer does not reinforce a bad learned path.
+ - Adaptive execution tests current/AUTO baselines first, then shorter generated routes. A clean direct route at or below 35 ms median / 75 ms worst stops route expansion. If direct is not excellent, up to three distinct RF-ranked one-hop paths are tried before deeper routes; a clean one-hop route at or below 45 ms median / 100 ms worst can stop expansion.
++- A clean existing application pin at or below 60 ms median / 150 ms worst receives an incumbent shortcut: after three RF-ranked challenger paths, testing stops if the incumbent still wins under the configured minimum-improvement hysteresis.
+ - Disable **Adaptive candidate testing** to benchmark the complete generated candidate set exactly as before.
+@@ -63,6 +66,7 @@ The action still exposes the apply controls so the intended UX is visible, but t
+ - If that confirmation cannot be completed, replacement is fail-safe: the incumbent is retained when possible, otherwise no replacement recommendation is produced.
+ - Whole-network skipped-node output includes node names and explicit reasons.
+ - Whole-network dry runs support 1–10 complete passes in a single action. The neighbor graph is built once, each pass benchmarks every eligible node, and compact per-pass winner summaries are retained for repeatability comparisons. Those summaries also report how many candidates adaptive testing actually measured/skipped. The top-level `results` field remains the full detailed result from the final pass.
++- Multi-pass network responses include `route_stability`, classifying each node as `exact_stable`, `path_stable`, `auto_policy_stable_path_dynamic`, `unstable`, `single_pass`, or `incomplete`, with candidate/path agreement and compact pass winners.
+ - Reverse return-route suggestions are generated and reported in dry-run output.
