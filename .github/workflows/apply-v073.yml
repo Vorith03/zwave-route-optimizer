@@ -1,0 +1,46 @@
+name: Apply v0.7.3
+
+on:
+  push:
+    paths:
+      - '.github/workflows/apply-v073.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Apply staged patch
+        run: |
+          git apply --check .seed/v073.patch
+          git apply .seed/v073.patch
+          cat .seed/v073-review.append >> ADVERSARIAL_REVIEW.md
+      - name: Validate release
+        run: |
+          python -m py_compile custom_components/zwave_route_optimizer/*.py
+          python - <<'PY'
+          import json, pathlib
+          manifest = json.loads(pathlib.Path('custom_components/zwave_route_optimizer/manifest.json').read_text())
+          assert manifest['version'] == '0.7.3'
+          PY
+          python - <<'PY'
+          import yaml, pathlib
+          yaml.safe_load(pathlib.Path('custom_components/zwave_route_optimizer/services.yaml').read_text())
+          PY
+          grep -q 'route_stability' custom_components/zwave_route_optimizer/optimizer.py
+          grep -q 'clean incumbent retained after' custom_components/zwave_route_optimizer/optimizer.py
+          grep -q 'learned_route_weight_after_baseline' custom_components/zwave_route_optimizer/optimizer.py
+      - name: Commit release and cleanup
+        run: |
+          rm -rf .seed
+          rm -f .github/workflows/apply-v073.yml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -m 'Release v0.7.3 adaptive stability improvements'
+          git push
