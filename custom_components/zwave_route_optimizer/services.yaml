@@ -111,30 +111,31 @@ optimize_network:
   name: Optimize Z-Wave network
   description: Manually benchmark all eligible classic Z-Wave nodes. Sleeping battery
     nodes and Z-Wave Long Range nodes are skipped. All nodes are restored to their
-    starting priority-route state while benchmarking. Whole-network writes are
-    intentionally disabled in v0.7.3.
+    starting priority-route state while benchmarking. Whole-network writes remain
+    disabled in v0.7.4; the response includes an apply_plan preview of routes that
+    meet the future bulk-write safety gate.
   fields:
     apply:
-      name: Apply best forward routes (disabled in v0.7.3)
-      description: Whole-network writes are intentionally blocked in v0.7.3. Leave this off.
+      name: Apply best forward routes (disabled in v0.7.4)
+      description: Whole-network writes are intentionally blocked in v0.7.4. Leave this off and review the returned apply_plan.
       default: false
       selector:
         boolean: null
     apply_return_route:
-      name: Apply suggested return routes (disabled in v0.7.3)
-      description: Whole-network return-route writes are intentionally blocked in v0.7.3. Leave this off; dry runs still analyze and report suggestions.
+      name: Apply suggested return routes (disabled in v0.7.4)
+      description: Whole-network return-route writes are intentionally blocked in v0.7.4. Leave this off; dry runs still analyze and report suggestions.
       default: false
       selector:
         boolean: null
     allow_unvalidated_return_route:
       name: Allow topology-unvalidated return routes
-      description: Reserved for future whole-network return-route writes. Dry-run always reports whether the suggested reverse path is topology-validated. Whole-network writes remain disabled in v0.7.3.
+      description: Reserved for future whole-network return-route writes. Dry-run always reports whether the suggested reverse path is topology-validated. Whole-network writes remain disabled in v0.7.4.
       default: false
       selector:
         boolean: null
     passes:
       name: Whole-network passes
-      description: Run the complete eligible-node benchmark this many times in one action. Useful for checking whether route recommendations are repeatable. Topology discovery runs once before the passes.
+      description: Run the complete eligible-node benchmark this many times in one action. At least two passes are required before apply_plan can mark a forward route write-ready.
       default: 1
       selector:
         number:

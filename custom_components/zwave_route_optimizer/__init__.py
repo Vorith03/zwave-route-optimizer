@@ -29,7 +29,7 @@ from .const import (
     SERVICE_OPTIMIZE_NETWORK,
     SERVICE_OPTIMIZE_NODE,
 )
-from .optimizer_v073 import RouteOptimizer
+from .optimizer_v074 import RouteOptimizer
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -119,10 +119,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             except HomeAssistantError:
                 raise
             except Exception as err:
-                _LOGGER.exception("Unexpected single-node optimization failure")
+                _LOGGGER.exception("Unexpected single-node optimization failure")
                 raise HomeAssistantError(str(err)) from err
 
-        async def _optimize_network(call: ServiceCall) -> dict[str, Any]:
+        async def _optimize_network (call: ServiceCall) -> dict[str, Any]:
             active = _get_optimizer(hass)
             try:
                 return await active.optimize_network(
@@ -132,7 +132,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             except HomeAssistantError:
                 raise
             except Exception as err:
-                _LOGGER.exception("Unexpected network optimization failure")
+                _LOGGGER.exception("Unexpected network optimization failure")
                 raise HomeAssistantError(str(err)) from err
 
         async_register_admin_service(
