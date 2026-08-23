@@ -29,7 +29,7 @@ from .const import (
     SERVICE_OPTIMIZE_NETWORK,
     SERVICE_OPTIMIZE_NODE,
 )
-from .optimizer import RouteOptimizer
+from .optimizer_v073 import RouteOptimizer
 
 _LOGGER = logging.getLogger(__name__)
 
