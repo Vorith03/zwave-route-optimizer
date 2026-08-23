@@ -20,6 +20,7 @@ from .const import (
     DEFAULT_MAX_CANDIDATES,
     DEFAULT_MAX_REPEATERS,
     DEFAULT_MIN_IMPROVEMENT,
+    DEFAULT_PASSES,
     DEFAULT_ROUNDS,
     DEFAULT_SETTLE_SECONDS,
     DEFAULT_WARMUP,
@@ -34,6 +35,7 @@ _LOGGER = logging.getLogger(__name__)
 ATTR_DEVICE_ID = "device_id"
 ATTR_APPLY = "apply"
 ATTR_ROUNDS = "rounds"
+ATTR_PASSES = "passes"
 ATTR_WARMUP = "warmup"
 ATTR_MAX_REPEATERS = "max_repeaters"
 ATTR_MAX_CANDIDATES = "max_candidates"
@@ -76,7 +78,15 @@ NODE_SCHEMA = vol.Schema(
     {vol.Required(ATTR_DEVICE_ID): cv.string, **COMMON_SCHEMA},
     extra=vol.PREVENT_EXTRA,
 )
-NETWORK_SCHEMA = vol.Schema(COMMON_SCHEMA, extra=vol.PREVENT_EXTRA)
+NETWORK_SCHEMA = vol.Schema(
+    {
+        **COMMON_SCHEMA,
+        vol.Optional(ATTR_PASSES, default=DEFAULT_PASSES): vol.All(
+            vol.Coerce(int), vol.Range(min=1, max=10)
+        ),
+    },
+    extra=vol.PREVENT_EXTRA,
+)
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -113,6 +123,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             active = _get_optimizer(hass)
             try:
                 return await active.optimize_network(
+                    passes=call.data[ATTR_PASSES],
                     **_options_from_call(call),
                 )
             except HomeAssistantError:
