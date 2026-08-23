@@ -201,6 +201,8 @@ class RouteOptimizer:
             "current_node_name": None,
             "node_index": None,
             "node_total": None,
+            "pass_index": None,
+            "pass_total": None,
             "candidate_index": None,
             "candidate_total": None,
             "current_route": None,
@@ -251,6 +253,8 @@ class RouteOptimizer:
             "current_node_name": None,
             "node_index": None,
             "node_total": node_total,
+            "pass_index": None,
+            "pass_total": None,
             "candidate_index": None,
             "candidate_total": None,
             "current_route": None,
@@ -275,6 +279,8 @@ class RouteOptimizer:
                 "current_node_name": None,
                 "node_index": None,
                 "node_total": None,
+                "pass_index": None,
+                "pass_total": None,
                 "candidate_index": None,
                 "candidate_total": None,
                 "current_route": None,
@@ -1694,6 +1700,7 @@ class RouteOptimizer:
         apply: bool,
         apply_return_route: bool,
         allow_unvalidated_return_route: bool,
+        passes: int,
         rounds: int,
         warmup: int,
         max_repeaters: int,
@@ -1704,10 +1711,10 @@ class RouteOptimizer:
         refresh_neighbors: bool,
     ) -> dict[str, Any]:
         """Benchmark the whole eligible mesh without committing route changes."""
-        # v0.7.0 deliberately keeps whole-network writes behind a hard guard.
+        # v0.7.1 deliberately keeps whole-network writes behind a hard guard.
         if apply or apply_return_route:
             raise HomeAssistantError(
-                "Whole-network Apply is intentionally disabled in v0.7.0. "
+                "Whole-network Apply is intentionally disabled in v0.7.1. "
                 "Run Optimize Z-Wave network with both apply toggles off; use "
                 "single-node optimization for deliberate route writes."
             )
@@ -1741,78 +1748,124 @@ class RouteOptimizer:
                         }
                     )
 
-                self._update_status(node_total=len(targets), completed_count=0)
-                node_results: list[dict[str, Any]] = []
+                self._update_status(
+                    node_total=len(targets),
+                    pass_total=passes,
+                    completed_count=0,
+                )
+                pass_results: list[dict[str, Any]] = []
+                final_results: list[dict[str, Any]] = []
+                completed_node_runs = 0
 
-                for index, node in enumerate(targets, start=1):
-                    await self._ensure_network_safe_to_test(check_ota=False)
-                    node_name = node.data.get("name") or f"Node {node.node_id}"
+                for pass_index in range(1, passes + 1):
+                    node_results: list[dict[str, Any]] = []
                     self._update_status(
                         phase="benchmark",
-                        current_node_id=node.node_id,
-                        current_node_name=node_name,
-                        node_index=index,
-                        node_total=len(targets),
+                        pass_index=pass_index,
+                        pass_total=passes,
+                        current_node_id=None,
+                        current_node_name=None,
+                        node_index=None,
                         candidate_index=None,
                         candidate_total=None,
                         current_route=None,
                     )
                     _LOGGER.info(
-                        "Z-Wave route optimizer: benchmarking node %s (%s/%s)",
-                        node.node_id,
-                        index,
-                        len(targets),
+                        "Z-Wave route optimizer: starting whole-network pass %s/%s",
+                        pass_index,
+                        passes,
                     )
-                    try:
-                        result, _, _ = await self._optimize_one(
-                            client=client,
-                            controller=controller,
-                            graph=graph,
-                            node=node,
-                            apply=False,
-                            apply_return_route=False,
-                            allow_unvalidated_return_route=allow_unvalidated_return_route,
-                            rounds=rounds,
-                            warmup=warmup,
-                            max_repeaters=max_repeaters,
-                            max_candidates=max_candidates,
-                            min_improvement=min_improvement,
-                            settle_seconds=settle_seconds,
-                            include_auto=include_auto,
-                            defer_apply=True,
-                        )
-                    except (asyncio.CancelledError, RouteRestoreError):
-                        raise
-                    except Exception as err:
-                        result = {
-                            "node_id": node.node_id,
-                            "name": node_name,
-                            "status": "error",
-                            "error": str(err),
-                            "applied": False,
-                            "applied_forward_route": False,
-                            "applied_return_route": False,
-                        }
 
-                    node_results.append(result)
-                    self._update_status(
-                        completed_count=index,
-                        latest_result=self._compact_latest_result(result),
-                        current_route=None,
+                    for index, node in enumerate(targets, start=1):
+                        await self._ensure_network_safe_to_test(check_ota=False)
+                        node_name = node.data.get("name") or f"Node {node.node_id}"
+                        self._update_status(
+                            phase="benchmark",
+                            current_node_id=node.node_id,
+                            current_node_name=node_name,
+                            node_index=index,
+                            node_total=len(targets),
+                            pass_index=pass_index,
+                            pass_total=passes,
+                            candidate_index=None,
+                            candidate_total=None,
+                            current_route=None,
+                        )
+                        _LOGGER.info(
+                            "Z-Wave route optimizer: pass %s/%s benchmarking node %s (%s/%s)",
+                            pass_index,
+                            passes,
+                            node.node_id,
+                            index,
+                            len(targets),
+                        )
+                        try:
+                            result, _, _ = await self._optimize_one(
+                                client=client,
+                                controller=controller,
+                                graph=graph,
+                                node=node,
+                                apply=False,
+                                apply_return_route=False,
+                                allow_unvalidated_return_route=allow_unvalidated_return_route,
+                                rounds=rounds,
+                                warmup=warmup,
+                                max_repeaters=max_repeaters,
+                                max_candidates=max_candidates,
+                                min_improvement=min_improvement,
+                                settle_seconds=settle_seconds,
+                                include_auto=include_auto,
+                                defer_apply=True,
+                            )
+                        except (asyncio.CancelledError, RouteRestoreError):
+                            raise
+                        except Exception as err:
+                            result = {
+                                "node_id": node.node_id,
+                                "name": node_name,
+                                "status": "error",
+                                "error": str(err),
+                                "applied": False,
+                                "applied_forward_route": False,
+                                "applied_return_route": False,
+                            }
+
+                        node_results.append(result)
+                        completed_node_runs += 1
+                        self._update_status(
+                            completed_count=completed_node_runs,
+                            latest_result=self._compact_latest_result(result),
+                            current_route=None,
+                        )
+
+                    pass_results.append(
+                        {
+                            "pass_index": pass_index,
+                            "completed_nodes": len(node_results),
+                            "results": [
+                                self._compact_latest_result(result)
+                                for result in node_results
+                            ],
+                        }
                     )
+                    final_results = node_results
 
                 return {
                     "mode": "whole_network",
                     "dry_run": True,
                     "whole_network_apply_enabled": False,
+                    "passes_requested": passes,
+                    "passes_completed": len(pass_results),
                     "eligible_nodes": len(targets),
-                    "completed_nodes": len(node_results),
+                    "completed_nodes": len(final_results),
+                    "completed_node_runs": completed_node_runs,
                     "skipped_node_ids": [item["node_id"] for item in skipped_nodes],
                     "skipped_nodes": skipped_nodes,
                     "warnings": warnings,
                     "rollback_errors": [],
                     "applied_node_ids": [],
-                    "results": node_results,
+                    "passes": pass_results,
+                    "results": final_results,
                 }
             except Exception as err:
                 self._update_status(
