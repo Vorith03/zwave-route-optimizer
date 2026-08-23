@@ -45,4 +45,4 @@ jobs:
           git commit -m 'Release v0.7.3 adaptive stability improvements'
           git push
 
-# trigger retry
+# trigger via merge
