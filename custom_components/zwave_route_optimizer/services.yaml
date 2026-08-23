@@ -1,0 +1,196 @@
+optimize_node:
+  name: Optimize one Z-Wave node
+  description: Manually benchmark controller-to-node source routes for one Z-Wave
+    device. The starting forward priority-route state is restored after testing unless
+    Apply best forward route is enabled. Return-route analysis is included.
+  fields:
+    device_id:
+      name: Z-Wave device
+      description: The Z-Wave node to benchmark.
+      required: true
+      selector:
+        device:
+          integration: zwave_js
+          multiple: false
+    apply:
+      name: Apply best forward route
+      description: Leave the winning controller-to-node route applied. Off leaves the starting forward priority state unchanged.
+      default: false
+      selector:
+        boolean: null
+    apply_return_route:
+      name: Apply suggested return route
+      description: Write the mirrored node-to-controller priority SUC return route after benchmarking. If the winning forward route differs from the current pin, Apply best forward route must also be enabled.
+      default: false
+      selector:
+        boolean: null
+    allow_unvalidated_return_route:
+      name: Allow topology-unvalidated return route
+      description: Allow writing the suggested return route when every reverse hop is not present in the current neighbor graph.
+      default: false
+      selector:
+        boolean: null
+    rounds:
+      name: Samples per route
+      default: 5
+      selector:
+        number:
+          min: 2
+          max: 20
+          step: 1
+          mode: box
+    warmup:
+      name: Warm-up pings
+      default: 1
+      selector:
+        number:
+          min: 0
+          max: 5
+          step: 1
+          mode: box
+    max_repeaters:
+      name: Maximum repeaters
+      description: Maximum number of repeaters in a generated source route.
+      default: 2
+      selector:
+        number:
+          min: 0
+          max: 4
+          step: 1
+          mode: slider
+    max_candidates:
+      name: Maximum generated candidates
+      default: 12
+      selector:
+        number:
+          min: 1
+          max: 60
+          step: 1
+          mode: box
+    min_improvement:
+      name: Minimum improvement
+      description: Percentage improvement required before replacing a nearly equivalent
+        current or automatic route.
+      default: 15
+      selector:
+        number:
+          min: 0
+          max: 100
+          step: 1
+          unit_of_measurement: '%'
+          mode: box
+    settle_seconds:
+      name: Route settle time
+      default: 0.2
+      selector:
+        number:
+          min: 0
+          max: 5
+          step: 0.05
+          unit_of_measurement: s
+          mode: box
+    include_auto:
+      name: Test automatic routing
+      default: true
+      selector:
+        boolean: null
+    refresh_neighbors:
+      name: Rediscover repeater neighbors first
+      description: Actively rediscover neighbors for always-listening routing nodes
+        before benchmarking. This adds substantial Z-Wave traffic.
+      default: false
+      selector:
+        boolean: null
+optimize_network:
+  name: Optimize Z-Wave network
+  description: Manually benchmark all eligible classic Z-Wave nodes. Sleeping battery
+    nodes and Z-Wave Long Range nodes are skipped. All nodes are restored to their
+    starting priority-route state while benchmarking. Whole-network writes are
+    intentionally disabled in v0.7.0.
+  fields:
+    apply:
+      name: Apply best forward routes (disabled in v0.7.0)
+      description: Whole-network writes are intentionally blocked in v0.7.0. Leave this off.
+      default: false
+      selector:
+        boolean: null
+    apply_return_route:
+      name: Apply suggested return routes (disabled in v0.7.0)
+      description: Whole-network return-route writes are intentionally blocked in v0.7.0. Leave this off; dry runs still analyze and report suggestions.
+      default: false
+      selector:
+        boolean: null
+    allow_unvalidated_return_route:
+      name: Allow topology-unvalidated return routes
+      description: Reserved for future whole-network return-route writes. Dry-run always reports whether the suggested reverse path is topology-validated. Whole-network writes remain disabled in v0.7.0.
+      default: false
+      selector:
+        boolean: null
+    rounds:
+      name: Samples per route
+      default: 5
+      selector:
+        number:
+          min: 2
+          max: 20
+          step: 1
+          mode: box
+    warmup:
+      name: Warm-up pings
+      default: 1
+      selector:
+        number:
+          min: 0
+          max: 5
+          step: 1
+          mode: box
+    max_repeaters:
+      name: Maximum repeaters
+      default: 2
+      selector:
+        number:
+          min: 0
+          max: 4
+          step: 1
+          mode: slider
+    max_candidates:
+      name: Maximum generated candidates per node
+      default: 12
+      selector:
+        number:
+          min: 1
+          max: 60
+          step: 1
+          mode: box
+    min_improvement:
+      name: Minimum improvement
+      default: 15
+      selector:
+        number:
+          min: 0
+          max: 100
+          step: 1
+          unit_of_measurement: '%'
+          mode: box
+    settle_seconds:
+      name: Route settle time
+      default: 0.2
+      selector:
+        number:
+          min: 0
+          max: 5
+          step: 0.05
+          unit_of_measurement: s
+          mode: box
+    include_auto:
+      name: Test automatic routing
+      default: true
+      selector:
+        boolean: null
+    refresh_neighbors:
+      name: Rediscover repeater neighbors first
+      description: Actively rediscover neighbors for always-listening routing nodes
+        before benchmarking. This adds substantial Z-Wave traffic.
+      default: false
+      selector:
+        boolean: null
