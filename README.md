@@ -1,6 +1,6 @@
 # Z-Wave Route Optimizer for Home Assistant
 
-Version: **0.7.0**
+Version: **0.7.1**
 
 A manually invoked Home Assistant custom integration for benchmarking and optionally pinning **classic Z-Wave application priority routes** using Home Assistant's existing Z-Wave JS connection.
 
@@ -32,11 +32,11 @@ If the winning forward route differs from the currently pinned route, applying o
 
 ### Whole-network writes
 
-**Whole-network Apply is intentionally disabled in v0.7.0.**
+**Whole-network Apply is intentionally disabled in v0.7.1.**
 
 The action still exposes the apply controls so the intended UX is visible, but turning either write toggle on causes the action to refuse before benchmarking or modifying the network. Whole-network mode is dry-run only for this release.
 
-## v0.7.0 behavior
+## v0.7.1 behavior
 
 - Classic Z-Wave only; Z-Wave Long Range is skipped.
 - Ordinary sleeping battery nodes are skipped; FLiRS targets remain supported.
@@ -53,17 +53,19 @@ The action still exposes the apply controls so the intended UX is visible, but t
 - If a challenger would replace an existing application priority route, the optimizer performs a fresh **incumbent vs challenger confirmation round** before recommending replacement.
 - If that confirmation cannot be completed, replacement is fail-safe: the incumbent is retained when possible, otherwise no replacement recommendation is produced.
 - Whole-network skipped-node output includes node names and explicit reasons.
+- Whole-network dry runs support 1–10 complete passes in a single action. The neighbor graph is built once, each pass benchmarks every eligible node, and compact per-pass winner summaries are retained for repeatability comparisons. The top-level `results` field remains the full detailed result from the final pass.
 - Reverse return-route suggestions are generated and reported in dry-run output.
 - Priority SUC return-route assignment is available through the existing single-node optimization action.
 - Unsupported return-route getter commands are detected after the first `unknown_command` response and suppressed for the rest of the Home Assistant runtime.
 
 ## Live status entity
 
-v0.7.0 adds a diagnostic **Status** sensor to the integration. During a run it exposes attributes including:
+v0.7.0 added a diagnostic **Status** sensor to the integration. During a run it exposes attributes including:
 
 - running / idle state
 - operation type
 - current node ID and name
+- pass X/Y for multi-pass network runs
 - node X/Y
 - candidate X/Y
 - current route
