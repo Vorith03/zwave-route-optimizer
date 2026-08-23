@@ -1,0 +1,25 @@
+{
+  "title": "Z-Wave Route Optimizer",
+  "config": {
+    "step": {
+      "user": {
+        "title": "Choose Z-Wave network",
+        "description": "Choose the existing Z-Wave integration this optimizer should use.",
+        "data": {
+          "zwave_entry_id": "Z-Wave network"
+        }
+      }
+    },
+    "abort": {
+      "single_instance_allowed": "Only one Z-Wave Route Optimizer instance is supported.",
+      "no_zwave": "No Z-Wave integration is available."
+    }
+  },
+  "entity": {
+    "sensor": {
+      "status": {
+        "name": "Status"
+      }
+    }
+  }
+}
