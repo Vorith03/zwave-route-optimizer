@@ -1,0 +1,320 @@
+                    current_node_name=node_name,
+                    candidate_index=candidate_index,
+                    candidate_total=len(candidates),
+                    current_route=candidate.label,
+                )
+                try:
+                    benchmark = await self._benchmark(
+                        client,
+                        node,
+                        candidate,
+                        rounds=rounds,
+                        warmup=warmup,
+                        settle_seconds=settle_seconds,
+                        baseline_median_ms=baseline,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as err:
+                    candidate_records.append(
+                        {
+                            "route": candidate.label,
+                            "repeaters": (
+                                None
+                                if candidate.repeaters is None
+                                else list(candidate.repeaters)
+                            ),
+                            "route_speed": candidate.speed,
+                            "route_speed_kbps": self._route_speed_kbps(candidate.speed),
+                            "error": str(err),
+                        }
+                    )
+                    continue
+                results.append(benchmark)
+                candidate_records.append(benchmark)
+
+            if results:
+                baseline = self._derive_device_baseline(results)
+                self._apply_device_baseline(results, baseline)
+                winner = self._choose_winner(results, previous, min_improvement)
+
+                # Existing pins get a fresh head-to-head confirmation before a
+                # different route is recommended. This protects a known-good pin
+                # from one unlucky outlier in the broad scan.
+                incumbent = previous.application
+                if incumbent is not None and not self._same_candidate(
+                    winner.candidate, incumbent
+                ):
+                    confirmation_candidates = [incumbent, winner.candidate]
+                    confirmation_results: list[BenchResult] = []
+                    confirmation_errors: list[dict[str, Any]] = []
+                    for confirmation_index, candidate in enumerate(
+                        confirmation_candidates, start=1
+                    ):
+                        self._update_status(
+                            phase="confirmation",
+                            candidate_index=confirmation_index,
+                            candidate_total=len(confirmation_candidates),
+                            current_route=candidate.label,
+                        )
+                        try:
+                            confirmation = await self._benchmark(
+                                client,
+                                node,
+                                candidate,
+                                rounds=rounds,
+                                warmup=warmup,
+                                settle_seconds=settle_seconds,
+                                baseline_median_ms=baseline,
+                            )
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as err:
+                            confirmation_errors.append(
+                                {"route": candidate.label, "error": str(err)}
+                            )
+                            continue
+                        confirmation_results.append(confirmation)
+
+                    if len(confirmation_results) == 2:
+                        confirmation_baseline = self._derive_device_baseline(
+                            confirmation_results
+                        )
+                        self._apply_device_baseline(
+                            confirmation_results, confirmation_baseline
+                        )
+                        winner = self._choose_winner(
+                            confirmation_results, previous, min_improvement
+                        )
+                        result_data["confirmation"] = {
+                            "performed": True,
+                            "reason": "challenger_would_replace_existing_application_priority_route",
+                            "results": [
+                                item.as_dict() for item in confirmation_results
+                            ],
+                            "winner": winner.as_dict(),
+                        }
+                    else:
+                        # Replacement is intentionally fail-safe. If the fresh
+                        # incumbent-vs-challenger comparison cannot complete, keep
+                        # the incumbent instead of removing/replacing a known pin.
+                        incumbent_confirmation = next(
+                            (
+                                result
+                                for result in confirmation_results
+                                if self._same_candidate(result.candidate, incumbent)
+                            ),
+                            None,
+                        )
+                        incumbent_initial = next(
+                            (
+                                result
+                                for result in results
+                                if self._same_candidate(result.candidate, incumbent)
+                            ),
+                            None,
+                        )
+                        safe_incumbent = incumbent_confirmation or incumbent_initial
+                        if safe_incumbent is not None:
+                            winner = safe_incumbent
+                        else:
+                            # We do not have enough fresh evidence to construct a
+                            # trustworthy replacement recommendation. Refuse to
+                            # replace rather than silently falling back to challenger.
+                            winner = None
+                            replacement_inconclusive = True
+                        result_data["confirmation"] = {
+                            "performed": True,
+                            "reason": "challenger_would_replace_existing_application_priority_route",
+                            "status": (
+                                "inconclusive_kept_incumbent"
+                                if safe_incumbent is not None
+                                else "inconclusive_no_replacement_recommendation"
+                            ),
+                            "errors": confirmation_errors,
+                        }
+        finally:
+            try:
+                # A cancelled HA service call must not strand the node on the
+                # last experimental route.
+                await asyncio.shield(
+                    self._restore_priority_state(client, node_id, previous)
+                )
+            except Exception as err:
+                _LOGGER.exception(
+                    "Failed restoring starting priority route for node %s", node_id
+                )
+                raise RouteRestoreError(
+                    f"Failed to restore the starting priority route for node {node_id}: {err}"
+                ) from err
+
+        # Re-render benchmark records only after the common device baseline is
+        # known, otherwise early candidates would retain self-relative slow counts.
+        final_baseline = self._derive_device_baseline(results)
+        self._apply_device_baseline(results, final_baseline)
+        result_data["candidates"] = [
+            record.as_dict() if isinstance(record, BenchResult) else record
+            for record in candidate_records
+        ]
+        result_data["device_baseline_median_ms"] = (
+            None if final_baseline is None else round(final_baseline, 1)
+        )
+
+        if winner is None:
+            result_data["status"] = (
+                "replacement_confirmation_inconclusive"
+                if replacement_inconclusive
+                else "all_candidates_failed"
+            )
+            return result_data, None, previous
+
+        # If confirmation selected an initial result object, ensure its diagnostics
+        # reflect the final common baseline too.
+        winner.baseline_median_ms = final_baseline
+        result_data["best"] = winner.as_dict()
+        suggestion = self._suggest_return_route(
+            winner.candidate,
+            graph,
+            controller.own_node_id,
+            node_id,
+        )
+        result_data["suggested_priority_suc_return_route"] = suggestion
+        result_data["return_route_apply_requested"] = apply_return_route
+        result_data["status"] = "ok"
+
+        # Validate all requested permanent writes before making the first one.
+        return_repeaters: tuple[int, ...] | None = None
+        return_speed: int | None = None
+        if apply_return_route:
+            if suggestion is None:
+                raise HomeAssistantError(
+                    f"Node {node_id} winner is AUTO, so there is no concrete return route to apply."
+                )
+            return_repeaters = tuple(int(value) for value in suggestion["repeaters"])
+            return_speed = int(suggestion["route_speed"])
+            for repeater_id in return_repeaters:
+                repeater = controller.nodes.get(repeater_id)
+                if repeater is None or not self._can_repeat(repeater):
+                    raise HomeAssistantError(
+                        f"Repeater {repeater_id} is no longer a usable routing node."
+                    )
+            topology_validated = self._return_route_topology_validated(
+                return_repeaters, graph, controller.own_node_id, node_id
+            )
+            if not topology_validated and not allow_unvalidated_return_route:
+                raise HomeAssistantError(
+                    "The suggested return route is not validated by the current "
+                    "neighbor graph. Enable 'Allow topology-unvalidated return route' "
+                    "to force it."
+                )
+            result_data["suggested_priority_suc_return_route"][
+                "topology_validated"
+            ] = topology_validated
+
+            # Applying only the return half is safe when the winning forward route
+            # is already the incumbent. Otherwise it would intentionally create a
+            # mismatched forward/return pair.
+            if not apply and not self._same_candidate(
+                winner.candidate, previous.application
+            ):
+                raise HomeAssistantError(
+                    "Applying the suggested return route without the winning forward "
+                    "route would create a mismatched pair. Enable 'Apply best forward "
+                    "route' as well, or keep the current pinned forward route as winner."
+                )
+
+        if (apply or apply_return_route) and not defer_apply:
+            forward_changed = False
+            try:
+                if apply:
+                    await self._apply_candidate(client, node_id, winner.candidate)
+                    forward_changed = True
+                    result_data["applied_forward_route"] = True
+
+                if apply_return_route:
+                    assert return_repeaters is not None and return_speed is not None
+                    await self._assign_priority_suc_return_route(
+                        client, node_id, return_repeaters, return_speed
+                    )
+                    result_data["applied_return_route"] = True
+                    result_data["return_route_state_after"] = (
+                        await self._get_cached_return_route_state(client, node_id)
+                    )
+            except asyncio.CancelledError:
+                if forward_changed:
+                    await asyncio.shield(
+                        self._restore_priority_state(client, node_id, previous)
+                    )
+                raise
+            except Exception as err:
+                if forward_changed:
+                    try:
+                        await asyncio.shield(
+                            self._restore_priority_state(client, node_id, previous)
+                        )
+                    except Exception as rollback_err:
+                        raise RouteRestoreError(
+                            f"Applying routes for node {node_id} failed and forward-route "
+                            f"rollback also failed: {rollback_err}. Original error: {err}"
+                        ) from rollback_err
+                uncertainty = (
+                    " Return-route state may be uncertain because Z-Wave JS cannot "
+                    "reliably read that route back from the node."
+                    if apply_return_route
+                    else ""
+                )
+                raise HomeAssistantError(
+                    f"Applying optimized route settings for node {node_id} failed; "
+                    f"the starting forward application-priority state was restored."
+                    f"{uncertainty} Original error: {err}"
+                ) from err
+
+            result_data["applied"] = bool(
+                result_data["applied_forward_route"]
+                or result_data["applied_return_route"]
+            )
+
+        return result_data, winner.candidate, previous
+
+    async def _rollback_priority_states(
+        self,
+        client: Any,
+        node_ids: list[int],
+        states: dict[int, PriorityState],
+    ) -> list[str]:
+        """Best-effort rollback for a failed/cancelled whole-network commit."""
+        errors: list[str] = []
+        for node_id in reversed(node_ids):
+            state = states.get(node_id)
+            if state is None:
+                errors.append(f"Node {node_id}: starting state missing")
+                continue
+            try:
+                await self._restore_priority_state(client, node_id, state)
+            except Exception as err:
+                _LOGGER.exception(
+                    "Failed rolling back application priority route for node %s",
+                    node_id,
+                )
+                errors.append(f"Node {node_id}: {err}")
+        return errors
+
+    async def optimize_node(
+        self,
+        node: Any,
+        *,
+        apply: bool,
+        apply_return_route: bool,
+        allow_unvalidated_return_route: bool,
+        rounds: int,
+        warmup: int,
+        max_repeaters: int,
+        max_candidates: int,
+        min_improvement: float,
+        settle_seconds: float,
+        include_auto: bool,
+        refresh_neighbors: bool,
+    ) -> dict[str, Any]:
+        """Optimize a single node."""
+        if self._run_lock.locked():
+            raise HomeAssistantError("A Z-Wave route optimization is already running.")
