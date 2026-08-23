@@ -1,0 +1,82 @@
+p=root/'ADVERSARIAL_REVIEW.md'; s=p.read_text(); s += '''
+
+## v0.7.1 — multi-pass whole-network dry runs
+
+### Pass 10 — repeatability without multiplying response size
+
+#### 1. Multi-pass scans must not change write safety
+
+**Constraint:** Whole-network Apply remains hard-disabled. Each pass invokes the same per-node dry-run path with `defer_apply=True`, so application-priority state is restored after each experimental node scan. The neighbor graph is built once before all passes.
+
+#### 2. Full per-pass candidate output would become excessively large
+
+**Problem:** A 23-node run with ~12 candidates per node is already large. Returning full candidate details for every pass would multiply the Home Assistant action response and make copy/paste analysis unwieldy.
+
+**Fix:** `passes` contains compact per-node summaries for every pass (winner, median, failures, slow samples). The existing top-level `results` field remains the full detailed result for the final pass, preserving the familiar single-pass response shape while keeping multi-pass output bounded.
+
+#### 3. Progress needed a pass dimension
+
+**Fix:** The diagnostic Status sensor now carries `pass_index` and `pass_total` during whole-network runs. `node_index/node_total` remain scoped to the current pass, while `completed_count` increases across all node-runs.
+
+#### 4. Node optimization must not accidentally accept the new option
+
+**Fix:** `passes` is added only to `NETWORK_SCHEMA` and is supplied separately by the network service handler. The shared single-node option extraction remains unchanged.
+
+### v0.7.1 regression validation
+
+- Python syntax compilation for all integration modules.
+- JSON parsing for `manifest.json`.
+- YAML parsing for `services.yaml`.
+- Structural check that `passes` is network-only with range 1–10 and default 1.
+- Response-shape review confirming full detail is retained only for the final pass and compact summaries are retained for every pass.
+- Status lifecycle review confirming pass fields initialize/reset cleanly and do not leak into subsequent single-node runs.
+- Whole-network Apply guard remains before any network access or pass iteration.
+
+
+## v0.7.2 — adaptive candidate benchmarking
+
+### Pass 11 — passive RF prioritization and route-expansion short circuits
+
+#### 1. Neighbor topology alone does not encode link quality
+
+**Problem:** A node appearing in a neighbor table only proves that communication was observed strongly enough for the topology cache; it does not mean every such link deserves an expensive benchmark.
+
+**Fix:** Adaptive mode reads passive Z-Wave JS node statistics when present. Recent node RSSI, controller-local background RSSI, and observed LWR/NLWR route/repeater RSSI are converted into ordering hints. These hints never hard-filter a topology-valid candidate. Missing, stale, sentinel, or unavailable RSSI therefore degrades gracefully to neutral ordering.
+
+#### 2. Passive RSSI is directional and can be stale
+
+**Risk:** Node statistics primarily describe recently observed traffic and can be asymmetric relative to the forward application-priority route being tested.
+
+**Fix:** RF evidence is deliberately used only for ranking. Candidate results expose `rf_score` and `rf_evidence`, and the response explicitly reports `hard_rssi_filtering: false`. No route is declared good because of RSSI alone.
+
+#### 3. Excellent direct links made deeper-route probing wasteful
+
+**Observed:** In the real two-pass network run, many mains-powered devices produced clean direct medians around 22–25 ms while one-hop routes clustered around ~40 ms and two-hop routes around ~55–60 ms or worse.
+
+**Fix:** Generated routes execute short-to-deep in adaptive mode. After current/AUTO baselines, a clean direct route with median <= 35 ms and worst <= 75 ms stops route expansion. This is a measured-result short circuit, not an RF-only decision.
+
+#### 4. Difficult nodes still needed repeater exploration
+
+**Fix:** If direct routing is not excellent, adaptive mode tests distinct one-hop paths in passive-RF priority order. After up to three distinct one-hop paths, a clean one-hop result with median <= 45 ms and worst <= 100 ms stops deeper expansion. Otherwise the remaining selected candidate set continues normally, including multi-hop routes.
+
+#### 5. Adaptive behavior needed an exhaustive fallback
+
+**Fix:** Both actions expose **Adaptive candidate testing**, enabled by default. Turning it off disables passive RF ordering and adaptive short-circuiting, restoring exhaustive benchmarking of the full generated candidate set.
+
+#### 6. Adaptive savings needed to be visible in multi-pass summaries
+
+**Fix:** Detailed results include a `candidate_strategy` object with planned/tested/skipped counts, thresholds, stop reason, and untested-route RF hints. Compact whole-network pass summaries include tested/skipped candidate counts and the adaptive stop reason.
+
+### v0.7.2 regression validation
+
+- Python syntax compilation for all integration modules.
+- JSON parsing for manifest/string/translation files and YAML parsing for `services.yaml`.
+- Passive RF ranking test proving an exact LWR match with stronger usable RSSI ranks ahead of a weak unrelated repeater.
+- Sentinel RSSI handling excludes non-negative Z-Wave RSSI error values from ranking.
+- Candidate-plan test confirms direct candidates execute before one-hop candidates while hop-diverse candidate budgeting remains intact.
+- Mocked direct-route flow confirms AUTO + an excellent direct route stop before remaining generated candidates and still restore the starting priority state.
+- Mocked one-hop flow confirms three distinct one-hop probes can stop before a two-hop route only when the measured one-hop result satisfies the conservative latency/reliability thresholds.
+- Whole-network Apply remains hard-disabled before topology discovery or adaptive benchmarking begins.
+'''; p.write_text(s)
+# optimizer
+p=cc/'optimizer.py'; t=p.read_text(); t=t.replace('''from .const import (\n    BPS_TO_ROUTE_SPEED,''','''from .const import (\n    ADAPTIVE_DIRECT_MEDIAN_MS,\n    ADAPTIVE_DIRECT_WORST_MS,\n    ADAPTIVE_ONE_HOP_MEDIAN_MS,\n    ADAPTIVE_ONE_HOP_PATHS,\n    ADAPTIVE_ONE_HOP_WORST_MS,\n    BPS_TO_ROUTE_SPEED,''',1); t=t.replace('''    repeaters: tuple[int, ...] | None\n    speed: int | None\n    label: str\n\n    @property''','''    repeaters: tuple[int, ...] | None\n    speed: int | None\n    label: str\n    rf_score: float = 0.0\n    rf_evidence: tuple[str, ...] = ()\n\n    @property''',1); t=t.replace('''            "route_speed_kbps": RouteOptimizer._route_speed_kbps(\n                self.candidate.speed\n            ),\n            "warmup_samples_ms": [''','''            "route_speed_kbps": RouteOptimizer._route_speed_kbps(\n                self.candidate.speed\n            ),\n            "rf_score": round(self.candidate.rf_score, 1),\n            "rf_evidence": list(self.candidate.rf_evidence),\n            "warmup_samples_ms": [''',1)
