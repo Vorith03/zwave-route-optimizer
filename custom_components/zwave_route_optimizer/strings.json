@@ -20,6 +20,11 @@
       "status": {
         "name": "Status"
       }
+    },
+    "button": {
+      "apply_last_optimization": {
+        "name": "Apply last optimization"
+      }
     }
   }
 }

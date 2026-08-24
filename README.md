@@ -1,10 +1,10 @@
 # Z-Wave Route Optimizer for Home Assistant
 
-Version: **0.7.4**
+Version: **0.8.0**
 
 A manually invoked Home Assistant custom integration for benchmarking and optionally pinning **classic Z-Wave application priority routes** using Home Assistant's existing Z-Wave JS connection.
 
-It does **not** run automatically, schedule optimizations, open a second Z-Wave JS connection, or optimize in the background.
+It does **not** schedule optimizations, open a second Z-Wave JS connection, or optimize in the background.
 
 ## Install
 
@@ -16,67 +16,97 @@ In **Developer Tools → Actions**:
 
 - **Z-Wave Route Optimizer: Optimize one Z-Wave node**
 - **Z-Wave Route Optimizer: Optimize Z-Wave network**
+- **Z-Wave Route Optimizer: Apply last network optimization**
 
-Both default to dry-run behavior.
+The integration also creates:
 
-### Single-node writes
+- a diagnostic **Status** sensor with live optimizer/apply progress;
+- an **Apply last optimization** button, available only while a staged plan has write-ready routes.
 
-The single-node action contains two explicit write toggles:
+## Whole-network workflow
 
-- **Apply best forward route**
-- **Apply suggested return route**
+Whole-network discovery and commitment are intentionally separate in v0.8.0.
 
-The return-route suggestion is the reversed winning forward route with reverse-topology validation. A topology-unvalidated return route can be explicitly allowed.
+1. Run **Optimize Z-Wave network**. It is always a dry run and restores every experimental application-priority route.
+2. The completed run produces `route_stability` and an `apply_plan` and stages that exact plan in memory.
+3. Review the returned plan. Only `ready_to_set` operations are eligible for automatic bulk Apply.
+4. Press **Apply last optimization** or run **Apply last network optimization**.
+5. The integration revalidates the staged plan before the first write, then writes and verifies each route transactionally.
 
-If the winning forward route differs from the currently pinned route, applying only the return route is blocked to avoid intentionally creating a mismatched forward/return pair.
+A new optimization replaces the previous staged plan. A Home Assistant restart discards it. A staged plan expires after **30 minutes**. A successful or attempted write transaction consumes the plan, so it cannot be replayed accidentally.
 
-### Whole-network writes
+### Bulk-write readiness policy
 
-**Whole-network Apply is intentionally disabled in v0.7.4.**
+A route becomes `ready_to_set` only when:
 
-This release adds an `apply_plan` preview to whole-network dry-run results. It is the proposed safety gate for v0.8.0 bulk forward Apply: only an explicit route that is `exact_stable`, clean in every requested pass, and different from the current application priority route is marked `ready_to_set`.
+- at least two complete passes were run;
+- the same explicit candidate won every pass (`exact_stable`);
+- every winning pass had zero failures and zero slow samples;
+- the winner differs from the starting application-priority route.
 
-Stable AUTO on an already-unpinned node is `leave_auto`; an already-matching pin is `no_change`; path-stable, AUTO-dynamic, unstable, incomplete, and existing-pin-clearing cases remain `hold`.
+Other outcomes are intentionally not written:
 
-## v0.7.4 behavior
+- already-matching stable explicit routes → `no_change`;
+- exact-stable AUTO on an already-unpinned node → `leave_auto`;
+- AUTO that would require clearing a current pin → `hold`;
+- path-stable, dynamic, incomplete, or unstable outcomes → `hold`.
+
+Three passes are recommended before using whole-network Apply even though two are sufficient for the write-readiness gate.
+
+## Apply preflight and transaction safety
+
+**Apply last network optimization does not benchmark again.** It commits exactly the staged plan that was produced by discovery.
+
+Before writing anything, v0.8.0:
+
+- confirms the Z-Wave integration/controller identity still matches the staged plan;
+- checks that disruptive controller work (route rebuild, inclusion/exclusion, OTA) is not active;
+- rebuilds the current cached neighbor graph and revalidates every staged path;
+- checks target/repeater eligibility, FLiRS beaming requirements, and end-to-end route speed support;
+- re-reads every affected node's current application-priority route and requires it to match the snapshot captured during discovery.
+
+If any material preflight check fails, **zero routes are written** and the stale plan is invalidated.
+
+Once preflight succeeds, each node is re-read immediately before its write to detect an external route change after preflight. Each write is then followed by application-priority-route readback verification. If a write or verification fails, every node whose write may have started is restored to its preflight snapshot in reverse order. Cancellation also shields rollback so a cancelled Home Assistant action cannot intentionally strand a partially applied plan.
+
+The response distinguishes successful rollback from `rollback_incomplete` and reports every rollback failure explicitly.
+
+## Return-route limitation
+
+Whole-network Apply modifies **forward application-priority routes only**. Bulk priority SUC return-route writes remain disabled because the actual route stored in an end node cannot be read back reliably enough to provide equivalent transactional rollback guarantees.
+
+The single-node action still exposes its existing deliberate forward and return-route write controls.
+
+## Benchmarking behavior
 
 - Classic Z-Wave only; Z-Wave Long Range is skipped.
 - Ordinary sleeping battery nodes are skipped; FLiRS targets remain supported.
-- FLiRS probes use an unscored wake-up phase followed by tightly grouped scored probes.
+- FLiRS probes use an unscored wake-up phase followed by grouped scored probes.
 - The final repeater into a FLiRS target must support beaming.
 - Route speeds use Serial API enums: `1=9.6k`, `2=40k`, `3=100k`.
 - Up to four repeaters are supported; the default maximum is two.
 - Existing application priority routes are distinguished from learned LWR/NLWR routes.
-- Every experimental forward route is restored before moving on.
-- Cancellation shields restoration of the starting application priority state.
-- Candidate generation is hop-diverse: direct, 1-hop, 2-hop, etc. receive independent path discovery and round-robin candidate slots so shallow routes cannot starve multi-hop routes.
-- **Adaptive candidate testing is enabled by default.** Passive Z-Wave JS node statistics are used only to prioritize topology-valid candidates; they never hard-filter a route.
-- Learned LWR/NLWR history is conditional. v0.7.4 fixes the v0.7.3 lifecycle bug so generated candidates are re-ranked **after the measured AUTO benchmark completes**, rather than during a metadata-only candidate iteration. Clean/fast AUTO gets full learned-history weight; poor AUTO gets zero learned-history weight; missing AUTO retains only the weak prior.
-- Adaptive execution tests current/AUTO baselines first, then shorter generated routes. A clean direct route at or below 35 ms median / 75 ms worst stops route expansion. Otherwise up to three RF-ranked one-hop paths are tried before deeper routes; a clean one-hop route at or below 45 ms median / 100 ms worst can stop expansion.
-- A clean existing application pin at or below 60 ms median / 150 ms worst can stop after three RF-ranked challenger paths if the incumbent still wins under the configured minimum-improvement hysteresis.
-- Disable **Adaptive candidate testing** to benchmark the complete generated candidate set exactly as before.
-- Slow-sample detection uses a **device/best-known baseline**, not the candidate's own median: `max(250 ms, best-known median × 4)`.
-- Pathological candidates can be eliminated early after two transaction failures or several clearly baseline-exceeding latency samples.
-- If a challenger would replace an existing application priority route, the optimizer performs a fresh **incumbent vs challenger confirmation round** before recommending replacement.
-- If that confirmation cannot be completed, replacement is fail-safe: the incumbent is retained when possible, otherwise no replacement recommendation is produced.
-- Whole-network skipped-node output includes node names and explicit reasons.
-- Whole-network dry runs support 1–10 complete passes in a single action. The neighbor graph is built once, each pass benchmarks every eligible node, and compact per-pass winner summaries are retained for repeatability comparisons. The top-level `results` field remains the full detailed result from the final pass.
-- Multi-pass responses include `route_stability`, classifying each node as `exact_stable`, `path_stable`, `auto_policy_stable_path_dynamic`, `unstable`, `single_pass`, or `incomplete`.
-- Multi-pass responses also include `apply_plan`, with `ready_to_set`, `no_change`, `leave_auto`, and `hold` decisions plus the exact proposed forward write operations. v0.7.4 never executes that plan.
-- Reverse return-route suggestions are generated and reported in dry-run output.
-- Priority SUC return-route assignment remains available through the existing single-node optimization action.
-- Unsupported return-route getter commands are detected after the first `unknown_command` response and suppressed for the rest of the Home Assistant runtime.
+- Every experimental forward route is restored before moving on; cancellation shields restoration.
+- Adaptive candidate testing is enabled by default and uses passive RF/history only for candidate ordering, never as a hard filter.
+- Learned LWR/NLWR history gets full ranking weight only after a measured clean/fast AUTO baseline; a poor AUTO result removes the learned-route bonus.
+- A clean direct route can stop expansion early; otherwise RF-ranked one-hop routes are tried before deeper paths.
+- A clean incumbent can stop after three challenger paths when it still wins under the configured hysteresis.
+- Slow/pathological candidates can be eliminated early using a best-known device baseline.
+- A challenger that would replace an existing application pin receives a fresh incumbent-vs-challenger confirmation round.
+- Whole-network runs support 1–10 passes and return compact per-pass summaries plus full detail for the final pass.
 
-## Live status entity
+## Live status
 
-The diagnostic **Status** sensor exposes running/idle state, operation type, current node, pass X/Y, node X/Y, candidate X/Y, current route, completed count, elapsed time, and the latest completed result. It is event-driven.
+The event-driven Status sensor tracks optimizer and Apply progress. During discovery it includes pass, node, candidate, route, elapsed time, and latest result. After discovery it reports `plan_ready`/`plan_no_changes` plus the staged plan ID/counts. During Apply it moves through phases including:
 
-## Return-route limitation
-
-Z-Wave cannot reliably read the actual priority SUC return route back from the end node. Some Z-Wave JS Server connections also reject the available getter command forms with `unknown_command`.
-
-Therefore reverse-topology validation is advisory, a successful return-route assignment cannot always be independently verified, and return-route writes are not transactionally reversible in the same way as forward application-priority routes. Bulk return-route Apply remains outside the v0.8.0 forward-write plan.
+- `preflight_topology`
+- `preflight`
+- `prewrite_check`
+- `applying`
+- `verifying`
+- `rollback` when required
+- `completed`, `rolled_back`, `rollback_incomplete`, or `plan_invalid`
 
 ## Dry-run caveat
 
-Dry-run restores the starting **application priority-route configuration**, but benchmarking traffic can still influence learned LWR/NLWR/controller routing state. There is no portable API to snapshot and restore every learned routing heuristic.
+Dry-run restores the starting **application priority-route configuration**, but benchmark traffic can still influence learned LWR/NLWR/controller routing state. There is no portable API to snapshot and restore every learned routing heuristic.

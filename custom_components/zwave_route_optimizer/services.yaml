@@ -1,8 +1,6 @@
 optimize_node:
   name: Optimize one Z-Wave node
-  description: Manually benchmark controller-to-node source routes for one Z-Wave
-    device. The starting forward priority-route state is restored after testing unless
-    Apply best forward route is enabled. Return-route analysis is included.
+  description: Manually benchmark controller-to-node source routes for one Z-Wave device. The starting forward priority-route state is restored after testing unless Apply best forward route is enabled. Return-route analysis is included.
   fields:
     device_id:
       name: Z-Wave device
@@ -69,8 +67,7 @@ optimize_node:
           mode: box
     min_improvement:
       name: Minimum improvement
-      description: Percentage improvement required before replacing a nearly equivalent
-        current or automatic route.
+      description: Percentage improvement required before replacing a nearly equivalent current or automatic route.
       default: 15
       selector:
         number:
@@ -102,40 +99,18 @@ optimize_node:
         boolean: null
     refresh_neighbors:
       name: Rediscover repeater neighbors first
-      description: Actively rediscover neighbors for always-listening routing nodes
-        before benchmarking. This adds substantial Z-Wave traffic.
+      description: Actively rediscover neighbors for always-listening routing nodes before benchmarking. This adds substantial Z-Wave traffic.
       default: false
       selector:
         boolean: null
+
 optimize_network:
   name: Optimize Z-Wave network
-  description: Manually benchmark all eligible classic Z-Wave nodes. Sleeping battery
-    nodes and Z-Wave Long Range nodes are skipped. All nodes are restored to their
-    starting priority-route state while benchmarking. Whole-network writes remain
-    disabled in v0.7.4; the response includes an apply_plan preview of routes that
-    meet the future bulk-write safety gate.
+  description: Benchmark all eligible classic Z-Wave nodes without committing changes. The completed run stages a short-lived apply plan containing only exact-stable, clean explicit forward routes. Use Apply last network optimization separately to commit that reviewed plan.
   fields:
-    apply:
-      name: Apply best forward routes (disabled in v0.7.4)
-      description: Whole-network writes are intentionally blocked in v0.7.4. Leave this off and review the returned apply_plan.
-      default: false
-      selector:
-        boolean: null
-    apply_return_route:
-      name: Apply suggested return routes (disabled in v0.7.4)
-      description: Whole-network return-route writes are intentionally blocked in v0.7.4. Leave this off; dry runs still analyze and report suggestions.
-      default: false
-      selector:
-        boolean: null
-    allow_unvalidated_return_route:
-      name: Allow topology-unvalidated return routes
-      description: Reserved for future whole-network return-route writes. Dry-run always reports whether the suggested reverse path is topology-validated. Whole-network writes remain disabled in v0.7.4.
-      default: false
-      selector:
-        boolean: null
     passes:
       name: Whole-network passes
-      description: Run the complete eligible-node benchmark this many times in one action. At least two passes are required before apply_plan can mark a forward route write-ready.
+      description: Run the complete eligible-node benchmark this many times. At least two passes are required before a route can become write-ready; three passes are recommended before applying a network-wide plan.
       default: 1
       selector:
         number:
@@ -212,8 +187,12 @@ optimize_network:
         boolean: null
     refresh_neighbors:
       name: Rediscover repeater neighbors first
-      description: Actively rediscover neighbors for always-listening routing nodes
-        before benchmarking. This adds substantial Z-Wave traffic.
+      description: Actively rediscover neighbors for always-listening routing nodes before benchmarking. This adds substantial Z-Wave traffic.
       default: false
       selector:
         boolean: null
+
+apply_last_network_optimization:
+  name: Apply last network optimization
+  description: Apply the write-ready forward application-priority routes from the most recent staged whole-network optimization. The plan is revalidated before the first write and applied transactionally; failures trigger rollback. Bulk return routes are never modified.
+  fields: {}

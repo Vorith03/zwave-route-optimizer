@@ -7,29 +7,30 @@ from typing import Any
 
 import voluptuous as vol
 
+from homeassistant.components.zwave_js.helpers import async_get_node_from_device_id
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant, ServiceCall, SupportsResponse
 from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.service import async_register_admin_service
-from homeassistant.components.zwave_js.helpers import async_get_node_from_device_id
 
 from .const import (
     CONF_ZWAVE_ENTRY_ID,
+    DEFAULT_ADAPTIVE_TESTING,
     DEFAULT_MAX_CANDIDATES,
     DEFAULT_MAX_REPEATERS,
     DEFAULT_MIN_IMPROVEMENT,
     DEFAULT_PASSES,
-    DEFAULT_ADAPTIVE_TESTING,
     DEFAULT_ROUNDS,
     DEFAULT_SETTLE_SECONDS,
     DEFAULT_WARMUP,
     DOMAIN,
+    SERVICE_APPLY_LAST_NETWORK_OPTIMIZATION,
     SERVICE_OPTIMIZE_NETWORK,
     SERVICE_OPTIMIZE_NODE,
 )
-from .optimizer_v074 import RouteOptimizer
+from .optimizer_v080 import RouteOptimizer
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -48,10 +49,9 @@ ATTR_REFRESH_NEIGHBORS = "refresh_neighbors"
 ATTR_APPLY_RETURN_ROUTE = "apply_return_route"
 ATTR_ALLOW_UNVALIDATED_RETURN_ROUTE = "allow_unvalidated_return_route"
 
-PLATFORMS = [Platform.SENSOR]
+PLATFORMS = [Platform.SENSOR, Platform.BUTTON]
 
-COMMON_SCHEMA = {
-    vol.Optional(ATTR_APPLY, default=False): cv.boolean,
+BENCHMARK_SCHEMA = {
     vol.Optional(ATTR_ROUNDS, default=DEFAULT_ROUNDS): vol.All(
         vol.Coerce(int), vol.Range(min=2, max=20)
     ),
@@ -73,23 +73,28 @@ COMMON_SCHEMA = {
     vol.Optional(ATTR_INCLUDE_AUTO, default=True): cv.boolean,
     vol.Optional(ATTR_ADAPTIVE_TESTING, default=DEFAULT_ADAPTIVE_TESTING): cv.boolean,
     vol.Optional(ATTR_REFRESH_NEIGHBORS, default=False): cv.boolean,
-    vol.Optional(ATTR_APPLY_RETURN_ROUTE, default=False): cv.boolean,
-    vol.Optional(ATTR_ALLOW_UNVALIDATED_RETURN_ROUTE, default=False): cv.boolean,
 }
 
 NODE_SCHEMA = vol.Schema(
-    {vol.Required(ATTR_DEVICE_ID): cv.string, **COMMON_SCHEMA},
+    {
+        vol.Required(ATTR_DEVICE_ID): cv.string,
+        vol.Optional(ATTR_APPLY, default=False): cv.boolean,
+        vol.Optional(ATTR_APPLY_RETURN_ROUTE, default=False): cv.boolean,
+        vol.Optional(ATTR_ALLOW_UNVALIDATED_RETURN_ROUTE, default=False): cv.boolean,
+        **BENCHMARK_SCHEMA,
+    },
     extra=vol.PREVENT_EXTRA,
 )
 NETWORK_SCHEMA = vol.Schema(
     {
-        **COMMON_SCHEMA,
+        **BENCHMARK_SCHEMA,
         vol.Optional(ATTR_PASSES, default=DEFAULT_PASSES): vol.All(
             vol.Coerce(int), vol.Range(min=1, max=10)
         ),
     },
     extra=vol.PREVENT_EXTRA,
 )
+APPLY_LAST_SCHEMA = vol.Schema({}, extra=vol.PREVENT_EXTRA)
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -98,8 +103,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     optimizer = RouteOptimizer(hass, entry.data[CONF_ZWAVE_ENTRY_ID])
     hass.data[DOMAIN][entry.entry_id] = optimizer
 
-    # Config flow enforces one integration entry, so one pair of global
-    # actions maps unambiguously to one Z-Wave network.
     if not hass.services.has_service(DOMAIN, SERVICE_OPTIMIZE_NODE):
 
         async def _optimize_node(call: ServiceCall) -> dict[str, Any]:
@@ -114,25 +117,41 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             try:
                 return await active.optimize_node(
                     node,
-                    **_options_from_call(call),
+                    **_node_options_from_call(call),
                 )
             except HomeAssistantError:
                 raise
             except Exception as err:
-                _LOGGGER.exception("Unexpected single-node optimization failure")
+                _LOGGER.exception("Unexpected single-node optimization failure")
                 raise HomeAssistantError(str(err)) from err
 
-        async def _optimize_network (call: ServiceCall) -> dict[str, Any]:
+        async def _optimize_network(call: ServiceCall) -> dict[str, Any]:
             active = _get_optimizer(hass)
             try:
                 return await active.optimize_network(
+                    apply=False,
+                    apply_return_route=False,
+                    allow_unvalidated_return_route=False,
                     passes=call.data[ATTR_PASSES],
-                    **_options_from_call(call),
+                    **_benchmark_options_from_call(call),
                 )
             except HomeAssistantError:
                 raise
             except Exception as err:
-                _LOGGGER.exception("Unexpected network optimization failure")
+                _LOGGER.exception("Unexpected network optimization failure")
+                raise HomeAssistantError(str(err)) from err
+
+        async def _apply_last_network_optimization(
+            call: ServiceCall,
+        ) -> dict[str, Any]:
+            del call
+            active = _get_optimizer(hass)
+            try:
+                return await active.apply_last_network_optimization()
+            except HomeAssistantError:
+                raise
+            except Exception as err:
+                _LOGGER.exception("Unexpected staged network apply failure")
                 raise HomeAssistantError(str(err)) from err
 
         async_register_admin_service(
@@ -151,9 +170,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             schema=NETWORK_SCHEMA,
             supports_response=SupportsResponse.OPTIONAL,
         )
+        async_register_admin_service(
+            hass,
+            DOMAIN,
+            SERVICE_APPLY_LAST_NETWORK_OPTIMIZATION,
+            _apply_last_network_optimization,
+            schema=APPLY_LAST_SCHEMA,
+            supports_response=SupportsResponse.OPTIONAL,
+        )
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
-
     return True
 
 
@@ -167,6 +193,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     if not hass.data.get(DOMAIN):
         hass.services.async_remove(DOMAIN, SERVICE_OPTIMIZE_NODE)
         hass.services.async_remove(DOMAIN, SERVICE_OPTIMIZE_NETWORK)
+        hass.services.async_remove(DOMAIN, SERVICE_APPLY_LAST_NETWORK_OPTIMIZATION)
         hass.data.pop(DOMAIN, None)
 
     return True
@@ -182,11 +209,9 @@ def _get_optimizer(hass: HomeAssistant) -> RouteOptimizer:
     return next(iter(configured.values()))
 
 
-def _options_from_call(call: ServiceCall) -> dict[str, Any]:
-    """Extract common optimizer options."""
+def _benchmark_options_from_call(call: ServiceCall) -> dict[str, Any]:
     data = call.data
     return {
-        "apply": data[ATTR_APPLY],
         "rounds": data[ATTR_ROUNDS],
         "warmup": data[ATTR_WARMUP],
         "max_repeaters": data[ATTR_MAX_REPEATERS],
@@ -196,6 +221,14 @@ def _options_from_call(call: ServiceCall) -> dict[str, Any]:
         "include_auto": data[ATTR_INCLUDE_AUTO],
         "adaptive_testing": data[ATTR_ADAPTIVE_TESTING],
         "refresh_neighbors": data[ATTR_REFRESH_NEIGHBORS],
+    }
+
+
+def _node_options_from_call(call: ServiceCall) -> dict[str, Any]:
+    data = call.data
+    return {
+        **_benchmark_options_from_call(call),
+        "apply": data[ATTR_APPLY],
         "apply_return_route": data[ATTR_APPLY_RETURN_ROUTE],
         "allow_unvalidated_return_route": data[ATTR_ALLOW_UNVALIDATED_RETURN_ROUTE],
     }
