@@ -106,7 +106,7 @@ optimize_node:
 
 optimize_network:
   name: Optimize Z-Wave network
-  description: Benchmark all eligible classic Z-Wave nodes without committing changes. The completed run stages a short-lived apply plan containing only exact-stable, clean explicit forward routes. Use Apply last network optimization separately to commit that reviewed plan.
+  description: Benchmark all eligible classic Z-Wave nodes without committing changes. The completed run stages a short-lived apply plan from exact-stable clean explicit routes and, with at least three passes, clean all-pass physical repeater consensus with an explicit majority. Stable direct paths remain on AUTO.
   fields:
     passes:
       name: Whole-network passes

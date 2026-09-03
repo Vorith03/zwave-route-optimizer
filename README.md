@@ -1,6 +1,6 @@
 # Z-Wave Route Optimizer for Home Assistant
 
-Version: **0.8.0**
+Version: **0.8.1**
 
 A manually invoked Home Assistant custom integration for benchmarking and optionally pinning **classic Z-Wave application priority routes** using Home Assistant's existing Z-Wave JS connection.
 
@@ -25,7 +25,7 @@ The integration also creates:
 
 ## Whole-network workflow
 
-Whole-network discovery and commitment are intentionally separate in v0.8.0.
+Whole-network discovery and commitment are intentionally separate.
 
 1. Run **Optimize Z-Wave network**. It is always a dry run and restores every experimental application-priority route.
 2. The completed run produces `route_stability` and an `apply_plan` and stages that exact plan in memory.
@@ -37,27 +37,41 @@ A new optimization replaces the previous staged plan. A Home Assistant restart d
 
 ### Bulk-write readiness policy
 
-A route becomes `ready_to_set` only when:
+v0.8.1 keeps the existing exact-stable policy and adds a conservative three-pass physical-consensus path for cases where AUTO and an explicit candidate represent the same repeater path.
 
-- at least two complete passes were run;
-- the same explicit candidate won every pass (`exact_stable`);
-- every winning pass had zero failures and zero slow samples;
-- the winner differs from the starting application-priority route.
+An explicit route can become `ready_to_set` in either of two ways:
+
+- **Exact stability:** at least two complete passes, the same explicit candidate won every pass, every winning pass had zero failures and zero slow samples, and the route differs from the starting application-priority route.
+- **Physical repeater consensus:** at least three complete passes, the physical repeater path is known and identical in every pass, every winning pass is clean, and the same exact explicit candidate on that path wins a strict majority of passes. For three passes this means at least **2/3 explicit wins**.
 
 Other outcomes are intentionally not written:
 
 - already-matching stable explicit routes → `no_change`;
 - exact-stable AUTO on an already-unpinned node → `leave_auto`;
+- an all-pass stable **direct** physical path on an unpinned node → `leave_auto` rather than creating an unnecessary direct pin;
+- path-stable repeater routes without an explicit majority → `hold`;
 - AUTO that would require clearing a current pin → `hold`;
-- path-stable, dynamic, incomplete, or unstable outcomes → `hold`.
+- incomplete, dynamic, or unstable outcomes → `hold`.
 
-Three passes are recommended before using whole-network Apply even though two are sufficient for the write-readiness gate.
+Three passes are recommended before using whole-network Apply because physical-consensus promotion is intentionally unavailable with only two passes.
+
+### Route-change review data
+
+`apply_plan.route_changes` provides a compact visualization-friendly record for every evaluated node. Each entry includes:
+
+- the starting application/learned route;
+- the all-pass physical consensus path and speed agreement when known;
+- the strongest exact explicit candidate and its win count;
+- compact per-pass winner, physical path, latency, failure, and slow-sample data;
+- the final `ready_to_set`, `leave_auto`, `no_change`, or `hold` decision and proposed write operation.
+
+This data is intended to support a future Home Assistant route-change visualization without changing the transaction format used by Apply.
 
 ## Apply preflight and transaction safety
 
 **Apply last network optimization does not benchmark again.** It commits exactly the staged plan that was produced by discovery.
 
-Before writing anything, v0.8.0:
+Before writing anything, the integration:
 
 - confirms the Z-Wave integration/controller identity still matches the staged plan;
 - checks that disruptive controller work (route rebuild, inclusion/exclusion, OTA) is not active;

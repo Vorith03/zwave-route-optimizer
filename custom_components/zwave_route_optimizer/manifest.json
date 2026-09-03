@@ -1,7 +1,7 @@
 {
   "domain": "zwave_route_optimizer",
   "name": "Z-Wave Route Optimizer",
-  "version": "0.8.0",
+  "version": "0.8.1",
   "config_flow": true,
   "dependencies": [
     "zwave_js"
